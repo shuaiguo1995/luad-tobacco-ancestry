@@ -1,0 +1,188 @@
+---
+title: "03 - Pooled versus smoking-stratified ancestry comparison, EAS versus Western"
+author: "Shuai Guo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+The pooled ancestry contrast, ignoring smoking. This is the framework of the
+original submission, retained because reviewer 1 asked for it to be kept but
+moved out of the main text.
+
+**It is reported for completeness, not as a primary result.** Every difference
+found here should be read against `01_four_groups.Rmd` (Figure 1B), which tests
+whether the same difference survives with smoking held fixed. The two groups
+differ 32.1% against 71.3% in ever-smoker proportion, so a pooled contrast
+measures ancestry and tobacco exposure at once.
+
+Section 3 gives the pooled-versus-stratified gene counts quoted in the Letter:
+2,063 of 8,428 genes differ pooled, and 13 differ in both smoking strata.
+Copy number is not analysed in this release, because the three sample-level
+quantifications are not comparable (see `05_sensitivity.Rmd`).
+
+```{r setup}
+  knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+  library(data.table)
+  library(ggplot2)
+  library(ggrepel)
+  library(patchwork)
+  source("_functions.R")
+
+  dir.create("../results/03_pooled_vs_stratified/tables", showWarnings = FALSE, recursive = TRUE)
+  dir.create("../results/03_pooled_vs_stratified/figures", showWarnings = FALSE, recursive = TRUE)
+
+  set.seed(20260809)
+  meta = load_metadata(drop_ancestry = TRUE, drop_hyper = FALSE)
+  sig_wide = load_signature_relative()
+  sig_meta = merge(meta, sig_wide, by = "SampleID")
+  sig_list = active_signatures(sig_wide)
+  point_class = load_point_mutation_classes()
+  point_meta = merge(meta, point_class, by = "SampleID")
+  classes = c("C>A", "C>G", "C>T", "T>A", "T>C", "T>G")
+  tmb_meta = meta[meta$HasTMB, ]
+  table(meta$Cohort, meta$CohortGroup)
+```
+
+# 1. Composition and the confounding itself
+
+```{r composition}
+  comp = NULL
+  for (g in c("EAS", "Western")) {
+    d = meta[meta$CohortGroup == g, ]
+    a = d$AgeNumeric[!is.na(d$AgeNumeric)]
+    comp = rbind(comp, data.frame(group = g, n = nrow(d),
+      never = sum(d$Smoking == "Never"), ever = sum(d$Smoking == "Ever"),
+      pct_ever = round(100 * mean(d$Smoking == "Ever"), 1),
+      pct_female = round(100 * mean(d$Gender == "Female", na.rm = TRUE), 1),
+      median_age = median(a), stringsAsFactors = FALSE))
+  }
+  write.csv(comp, "../results/03_pooled_vs_stratified/tables/01_composition.csv", row.names = FALSE)
+  comp
+```
+
+# 2. Continuous layers, pooled
+
+```{r pooled-continuous}
+  pooled = NULL
+  r = test_two_group(tmb_meta$NonsynonymousPerMb, tmb_meta$CohortGroup,
+                     "EAS", "Western", "TMB")
+  r$layer = "TMB"
+  pooled = rbind(pooled, r)
+  for (i in seq_along(sig_list)) {
+    r = test_two_group(sig_meta[[sig_list[i]]], sig_meta$CohortGroup,
+                       "EAS", "Western", sig_list[i])
+    if (is.null(r)) {
+      next
+    }
+    r$layer = "signature"
+    pooled = rbind(pooled, r)
+  }
+  for (i in seq_along(classes)) {
+    r = test_two_group(point_meta[[classes[i]]], point_meta$CohortGroup,
+                       "EAS", "Western", classes[i])
+    if (is.null(r)) {
+      next
+    }
+    r$layer = "substitution class"
+    pooled = rbind(pooled, r)
+  }
+  pooled$p_adjusted = p.adjust(pooled$p_value, method = "BH")
+  write.csv(pooled, "../results/03_pooled_vs_stratified/tables/02_pooled_continuous.csv",
+            row.names = FALSE)
+  cat("features tested:", nrow(pooled), " significant:",
+      sum(pooled$p_adjusted < 0.05, na.rm = TRUE), "\n")
+  head(pooled[order(pooled$p_adjusted), c("layer", "feature", "median_a",
+                                          "median_b", "p_adjusted")], 15)
+```
+
+```{r pooled-signature-volcano}
+  d = pooled[pooled$layer == "signature", ]
+  p = volcano_plot(d, "log2_ratio", "p_adjusted", "feature",
+                   "Mutational signatures, pooled ancestry contrast",
+                   expression(log[2] * " median ratio (EAS / Western)"),
+                   LABEL_SIGNATURES, 12)
+  ggsave("../results/03_pooled_vs_stratified/figures/volcano_signature.pdf", p,
+         width = 4.8, height = 4.4, device = cairo_pdf)
+  p
+```
+
+```{r pooled-tmb-figure}
+  d = tmb_meta
+  d$y = d$NonsynonymousPerMb + 0.01
+  d$Cohort = factor(d$Cohort, levels = c("Guo2026", "Chen2019", "Chen2020",
+                                         "Xu2020", "TCGA2014", "TRACERx2023"))
+  p_tmb = ggplot(d, aes(x = Cohort, y = y, fill = CohortGroup))
+  p_tmb = p_tmb + geom_violin(trim = FALSE, scale = "width", alpha = 0.45,
+                              linewidth = 0.3)
+  p_tmb = p_tmb + geom_jitter(width = 0.12, size = 0.35, alpha = 0.25,
+                              colour = "grey20", stroke = 0)
+  p_tmb = p_tmb + geom_boxplot(width = 0.14, outlier.shape = NA, alpha = 0.9,
+                               linewidth = 0.3, show.legend = FALSE)
+  p_tmb = p_tmb + scale_fill_manual(values = GROUP_COLS, name = NULL)
+  p_tmb = p_tmb + scale_y_log10()
+  p_tmb = p_tmb + labs(x = NULL, y = "protein-altering mutations / Mb",
+                       title = "Tumour mutation burden across the six cohorts")
+  p_tmb = p_tmb + theme_pub()
+  p_tmb = p_tmb + theme(axis.text.x = element_text(angle = 30, hjust = 1),
+                        legend.position = "top")
+  ggsave("../results/03_pooled_vs_stratified/figures/tmb_by_cohort.pdf", p_tmb,
+         width = 5.5, height = 3.8, device = cairo_pdf)
+  p_tmb
+```
+
+# 3. Driver genes, pooled and genome-wide
+
+```{r pooled-drivers}
+  driver_meta = meta[meta$HasFullMAF, ]
+  snv_pa = load_protein_altering(unique(driver_meta$Cohort))
+  gene_tab = table(snv_pa$Gene[snv_pa$SampleID %in% driver_meta$SampleID])
+  test_genes = names(gene_tab)[gene_tab >= MIN_GENE_MUTATED]
+
+  drv = NULL
+  for (i in seq_along(test_genes)) {
+    hit = driver_meta$SampleID %in% snv_pa$SampleID[snv_pa$Gene == test_genes[i]]
+    r = test_two_group_binary(hit, driver_meta$CohortGroup, "EAS", "Western",
+                              test_genes[i])
+    drv = rbind(drv, r)
+  }
+  drv$p_adjusted = p.adjust(drv$p_value, method = "BH")
+  write.csv(drv, "../results/03_pooled_vs_stratified/tables/03_driver_pooled.csv", row.names = FALSE)
+  cat("genes tested:", nrow(drv), "\n")
+  cat("EAS-enriched:", sum(drv$p_adjusted < 0.05 & drv$log2_odds_ratio > 0), "\n")
+  cat("Western-enriched:", sum(drv$p_adjusted < 0.05 & drv$log2_odds_ratio < 0), "\n")
+
+  p = volcano_plot(drv, "log2_odds_ratio", "p_adjusted", "feature",
+                   "Driver genes, pooled ancestry contrast",
+                   expression(log[2] * " odds ratio (EAS / Western)"),
+                   LABEL_GENES, 16)
+  ggsave("../results/03_pooled_vs_stratified/figures/volcano_driver.pdf", p,
+         width = 4.8, height = 4.4, device = cairo_pdf)
+  p
+```
+
+```{r pooled-vs-stratified}
+  s1 = "../results/01_four_groups/tables/06_driver_genomewide.csv"
+  if (file.exists(s1)) {
+    strat = read.csv(s1, stringsAsFactors = FALSE)
+    nv = strat[strat$contrast == "ancestry within never-smokers", ]
+    ev = strat[strat$contrast == "ancestry within ever-smokers", ]
+    surv = data.frame(gene = drv$feature, pooled_p = drv$p_adjusted,
+                      stringsAsFactors = FALSE)
+    surv$never_p = nv$p_adjusted[match(surv$gene, nv$feature)]
+    surv$ever_p = ev$p_adjusted[match(surv$gene, ev$feature)]
+    surv = surv[!is.na(surv$never_p) & !is.na(surv$ever_p), ]
+    surv$survives = surv$never_p < 0.05 & surv$ever_p < 0.05
+    surv$pooled_only = surv$pooled_p < 0.05 & !surv$survives
+    write.csv(surv, "../results/03_pooled_vs_stratified/tables/04_pooled_vs_stratified.csv",
+              row.names = FALSE)
+    cat("significant pooled:", sum(surv$pooled_p < 0.05), "\n")
+    cat("survive in both smoking strata:", sum(surv$survives), "\n")
+    cat("pooled only, i.e. explained by smoking:", sum(surv$pooled_only), "\n")
+    surv[surv$gene %in% LABEL_GENES, ]
+  }
+```
+
+```{r session}
+  sessionInfo()
+```

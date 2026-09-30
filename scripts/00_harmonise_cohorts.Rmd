@@ -1,0 +1,680 @@
+---
+title: "00 Harmonise the six cohorts"
+author: "Shuai Guo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup}
+  knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+  library(readxl)
+  library(data.table)
+  library(fst)
+  library(NMF)
+
+  dir.create("../data", recursive = TRUE, showWarnings = FALSE)
+  dir.create("../data/signature", recursive = TRUE, showWarnings = FALSE)
+
+  exome_size_mb = 38
+  set.seed(20260809)
+```
+
+# 1. Variant classification
+
+Each cohort ships a different annotation vocabulary. Three tiers are produced so
+that R2-4 can be answered without re-reading the raw files.
+
+```{r variant-class-vocab}
+# --- MAF style (Chen2019, Chen2020, Guo2026, Xu2020) -------------------------
+  maf_protein_altering = c(
+    "Missense_Mutation", "Nonsense_Mutation", "Nonstop_Mutation",
+    "Frame_Shift", "Frame_Shift_Del", "Frame_Shift_Ins",
+    "In_Frame_Del", "In_Frame_Ins", "Splice_Site",
+    "Translation_Start_Site", "Start_Codon_SNP", "Start_Codon_Del",
+    "Start_Codon_Ins", "Stop_Codon_Del",
+    "De_novo_Start_InFrame", "De_novo_Start_OutOfFrame")
+  maf_silent = c("Silent")
+  maf_noncoding = c("Intron", "IGR", "3'UTR", "5'UTR", "5'Flank", "3'Flank",
+                    "RNA", "lincRNA", "Splice_Region")
+
+  classify_maf = function(x) {
+    out = rep("unknown", length(x))
+    out[x %in% maf_protein_altering] = "protein_altering"
+    out[x %in% maf_silent] = "silent"
+    out[x %in% maf_noncoding] = "noncoding"
+    out
+  }
+
+# --- VEP / SnpEff style (TCGA2014). Terms are ';' separated; the most severe ---
+# --- term present determines the class.                                     ---
+  vep_protein_altering = c(
+    "frameshift_variant", "stop_gained", "stop_lost", "start_lost",
+    "splice_acceptor_variant", "splice_donor_variant",
+    "inframe_deletion", "inframe_insertion", "missense_variant",
+    "protein_altering_variant", "coding_sequence_variant",
+    "incomplete_terminal_codon_variant")
+  vep_silent = c("synonymous_variant", "stop_retained_variant",
+                 "start_retained_variant")
+
+  classify_vep = function(x) {
+    x = as.character(x)
+    out = rep("noncoding", length(x))
+    out[is.na(x) | x == ""] = "unknown"
+    hit_silent = rep(FALSE, length(x))
+    for (term in vep_silent) {
+      hit_silent = hit_silent | grepl(paste0("(^|;)", term, "($|;)"), x)
+    }
+    out[hit_silent] = "silent"
+    hit_pa = rep(FALSE, length(x))
+    for (term in vep_protein_altering) {
+      hit_pa = hit_pa | grepl(paste0("(^|;)", term, "($|;)"), x)
+    }
+    out[hit_pa] = "protein_altering"
+    out
+  }
+
+# --- ANNOVAR style (TRACERx2023): func gives the region, exonic.func the -----
+# --- consequence. exonic.func is NA for every non-exonic variant.        -----
+  annovar_protein_altering = c(
+    "nonsynonymous SNV", "nonsynonymous", "stopgain SNV", "stopgain",
+    "immediate-stopgain", "stoploss SNV", "stoploss",
+    "frameshift substitution", "frameshift insertion", "frameshift deletion",
+    "nonframeshift substitution", "nonframeshift insertion",
+    "nonframeshift deletion")
+  annovar_silent = c("synonymous SNV", "synonymous")
+
+  classify_annovar = function(func, exonic_func) {
+    func = as.character(func)
+    exonic_func = as.character(exonic_func)
+    out = rep("noncoding", length(func))
+    is_exonic = func %in% c("exonic", "exonic;splicing")
+    out[is_exonic & exonic_func %in% annovar_protein_altering] = "protein_altering"
+    out[is_exonic & exonic_func %in% annovar_silent] = "silent"
+    out[is_exonic & !(exonic_func %in% c(annovar_protein_altering, annovar_silent))] = "unknown"
+    out[func %in% c("splicing")] = "protein_altering"
+    out
+  }
+
+  standardize_smoking = function(value) {
+    value = as.character(value)
+    out = rep(NA_character_, length(value))
+    out[value %in% c("Yes", "Former/current", "Current Smoker", "Smoker",
+                     "Ex-Smoker", "Ever", "1")] = "Ever"
+    out[value %in% c("No", "Never Smoked", "Non-smoker", "Never", "0")] = "Never"
+    out
+  }
+```
+
+# 2. Cohort harmonisation
+
+Sample identifiers differ within as well as between cohorts, so each block
+normalises to a single `SampleID` before anything else happens.
+
+## 2.1 Chen2019 (EAS, n = 197)
+
+`02_somatic_mutation.xlsx` holds **227 rows for 154 samples** - it is a curated
+driver table, not a full exome MAF. Chen2019 therefore contributes clinical data
+and TMB only, and is excluded from driver-frequency and signature analyses. The
+flag is written to the frozen metadata so every downstream script applies the
+same rule.
+
+```{r chen2019}
+  chen2019_info_raw = as.data.frame(read_excel("../raw/Chen2019_LUAD197/01_cohort_info.xlsx"))
+  chen2019_info = data.frame(
+    Cohort = "Chen2019",
+    SampleID = chen2019_info_raw[["Tumor DNA"]],
+    Gender = chen2019_info_raw$Gender,
+    AgeGroup = chen2019_info_raw$Age,
+    AgeNumeric = NA_real_,
+    Smoking = standardize_smoking(chen2019_info_raw[["Smoking status"]]),
+    stringsAsFactors = FALSE)
+  chen2019_info$Gender[chen2019_info$Gender == "F"] = "Female"
+  chen2019_info$Gender[chen2019_info$Gender == "M"] = "Male"
+  chen2019_info$AgeGroup[chen2019_info$AgeGroup %in% c("<30", "30-40")] = "<40"
+  chen2019_info$AgeGroup[chen2019_info$AgeGroup %in% c(">=80", "70-80")] = ">70"
+  write.csv(chen2019_info, "../data/Chen2019_info.csv", row.names = FALSE)
+
+  chen2019_snv_raw = as.data.frame(read_excel("../raw/Chen2019_LUAD197/02_somatic_mutation.xlsx"))
+  chen2019_fusion_labels = c("ROS1--CD74", "CD74--ROS1", "EML4--ALK", "KIF5B--RET")
+  chen2019_snv = chen2019_snv_raw[!chen2019_snv_raw[["Variant type"]] %in% chen2019_fusion_labels, ]
+  chen2019_snv = data.frame(
+    Cohort = "Chen2019",
+    SampleID = chen2019_snv$SampleID,
+    Gene = chen2019_snv$Gene,
+    Chr = chen2019_snv$Chr,
+    Start = chen2019_snv$Start,
+    End = chen2019_snv$End,
+    Ref = chen2019_snv$Ref,
+    Alt = chen2019_snv$Alt,
+    VariantType = chen2019_snv[["Variant type"]],
+    stringsAsFactors = FALSE)
+  chen2019_snv$VariantClass = classify_maf(chen2019_snv$VariantType)
+  write.csv(chen2019_snv, "../data/Chen2019_snv.csv", row.names = FALSE)
+
+  chen2019_tmb_raw = as.data.frame(read_excel("../raw/Chen2019_LUAD197/04_tmb.xlsx"))
+  colnames(chen2019_tmb_raw)[3] = "NonsynonymousPerMb"
+  chen2019_tmb = data.frame(
+    Cohort = "Chen2019",
+    SampleID = chen2019_tmb_raw$SampleID,
+    NonsynonymousMutation = NA_real_,
+    NonsynonymousPerMb = as.numeric(chen2019_tmb_raw$NonsynonymousPerMb),
+    TMBSource = "published",
+    stringsAsFactors = FALSE)
+  write.csv(chen2019_tmb, "../data/Chen2019_tmb.csv", row.names = FALSE)
+```
+
+## 2.2 Chen2020 (EAS, n = 305)
+
+Three ID spaces were checked and they agree: cBioPortal clinical, the cohort
+spreadsheet and the MAF all use the same identifiers
+(213 `A*`, 59 `BGI-RS*`, 24 `BGI-WG*`, 9 `BGI-EX*`). The MAF covers 302
+samples; A184, A484 and A489 have clinical data only.
+
+```{r chen2020}
+  chen2020_info_raw = as.data.frame(read_excel("../raw/Chen2020_LUAD305/01_cohort_info.xlsx", skip = 1))
+  chen2020_info = data.frame(
+    Cohort = "Chen2020",
+    SampleID = chen2020_info_raw$Patient.ID,
+    Gender = chen2020_info_raw$Gender,
+    AgeGroup = NA_character_,
+    AgeNumeric = as.numeric(chen2020_info_raw$Age),
+    Smoking = standardize_smoking(chen2020_info_raw$Smoker),
+    SubCohort = chen2020_info_raw$Cohort,
+    stringsAsFactors = FALSE)
+  write.csv(chen2020_info, "../data/Chen2020_info.csv", row.names = FALSE)
+
+  chen2020_maf = fread("../raw/Chen2020_LUAD305/gis031_lung_adeno_nccs_2020/snv_indel.maf",
+                       data.table = FALSE, showProgress = FALSE)
+  chen2020_snv = data.frame(
+    Cohort = "Chen2020",
+    SampleID = chen2020_maf$Tumor_Sample_Barcode,
+    Gene = chen2020_maf$Hugo_Symbol,
+    Chr = chen2020_maf$Chromosome,
+    Start = chen2020_maf$Start_position,
+    End = chen2020_maf$End_position,
+    Ref = chen2020_maf$Reference_Allele,
+    Alt = chen2020_maf$Tumor_Seq_Allele2,
+    VariantType = chen2020_maf$Variant_Classification,
+    stringsAsFactors = FALSE)
+  chen2020_snv$VariantClass = classify_maf(chen2020_snv$VariantType)
+  write.csv(chen2020_snv, "../data/Chen2020_snv.csv", row.names = FALSE)
+
+  chen2020_tmb_raw = as.data.frame(read_excel("../raw/Chen2020_LUAD305/04_tmb.xlsx", sheet = "final"))
+  colnames(chen2020_tmb_raw)[1] = "SampleID"
+  chen2020_tmb = data.frame(
+    Cohort = "Chen2020",
+    SampleID = chen2020_tmb_raw$SampleID,
+    NonsynonymousMutation = as.numeric(chen2020_tmb_raw$Nonsynonymous_Mutation),
+    NonsynonymousPerMb = as.numeric(chen2020_tmb_raw[["Total.Nonsynonymous.Mutation.Burden/MB"]]),
+    TMBSource = "published",
+    stringsAsFactors = FALSE)
+  write.csv(chen2020_tmb, "../data/Chen2020_tmb.csv", row.names = FALSE)
+```
+
+## 2.3 Xu2020 (EAS, n = 103)
+
+```{r xu2020}
+  xu2020_info_raw = as.data.frame(read_excel("../raw/Xu2020_LUAD103/01_cohort_info.xlsx"))
+  xu2020_info = data.frame(
+    Cohort = "Xu2020",
+    SampleID = xu2020_info_raw$SampleID,
+    Gender = ifelse(xu2020_info_raw[["Gender (1:Male;2:Female)"]] == 2, "Female", "Male"),
+    AgeGroup = NA_character_,
+    AgeNumeric = as.numeric(xu2020_info_raw$Age),
+    Smoking = ifelse(xu2020_info_raw[["Smoke Status (0:Non-smoker; 1:Smoker)"]] == 1, "Ever", "Never"),
+    stringsAsFactors = FALSE)
+  write.csv(xu2020_info, "../data/Xu2020_info.csv", row.names = FALSE)
+
+  xu2020_snv_raw = as.data.frame(read_excel("../raw/Xu2020_LUAD103/02_somatic_mutation.xlsx", sheet = "final"))
+  xu2020_snv = data.frame(
+    Cohort = "Xu2020",
+    SampleID = xu2020_snv_raw$SampleID,
+    Gene = xu2020_snv_raw$Gene,
+    Chr = xu2020_snv_raw$Chr,
+    Start = xu2020_snv_raw$Start,
+    End = xu2020_snv_raw$End,
+    Ref = xu2020_snv_raw$Ref,
+    Alt = xu2020_snv_raw$Alt,
+    VariantType = xu2020_snv_raw$VariantType,
+    stringsAsFactors = FALSE)
+  xu2020_snv$VariantClass = classify_maf(xu2020_snv$VariantType)
+  write.csv(xu2020_snv, "../data/Xu2020_snv.csv", row.names = FALSE)
+
+  xu2020_nonsyn = xu2020_snv[xu2020_snv$VariantClass == "protein_altering", ]
+  xu2020_counts = as.data.frame(table(xu2020_nonsyn$SampleID), stringsAsFactors = FALSE)
+  colnames(xu2020_counts) = c("SampleID", "NonsynonymousMutation")
+  xu2020_tmb = merge(xu2020_info[, c("Cohort", "SampleID")], xu2020_counts, by = "SampleID", all.x = TRUE)
+  xu2020_tmb$NonsynonymousMutation[is.na(xu2020_tmb$NonsynonymousMutation)] = 0
+  xu2020_tmb$NonsynonymousPerMb = xu2020_tmb$NonsynonymousMutation / exome_size_mb
+  xu2020_tmb$TMBSource = "recomputed"
+  write.csv(xu2020_tmb, "../data/Xu2020_tmb.csv", row.names = FALSE)
+```
+
+## 2.4 Guo2026 (EAS in-house, n = 19)
+
+Two identifier formats occur in this cohort: `FEZL-01` in the clinical sheet and
+`FEZL_01C` in the MAF barcodes. Both are normalised to `FEZL_01`; the
+normaliser also strips a tumour-versus-normal suffix such as
+`FEZL_01C_vs_FEZL_01N`.
+
+```{r guo2026}
+  normalise_guo_id = function(x) {
+    x = as.character(x)
+    x = sub("_vs_.*$", "", x)
+    x = gsub("-", "_", x)
+    x = sub("C$", "", x)
+    x = sub("_$", "", x)
+    x
+  }
+
+  guo_info_raw = as.data.frame(read_excel("../raw/Guo2026_LUAD19/01_cohort.xlsx"))
+  guo_info = data.frame(
+    Cohort = "Guo2026",
+    SampleID = normalise_guo_id(guo_info_raw$Sample),
+    Gender = guo_info_raw$Gender,
+    AgeGroup = NA_character_,
+    AgeNumeric = as.numeric(guo_info_raw$Age),
+    Smoking = standardize_smoking(guo_info_raw$Smoking),
+    stringsAsFactors = FALSE)
+  write.csv(guo_info, "../data/Guo2026_info.csv", row.names = FALSE)
+
+  guo_files = list.files("../raw/Guo2026_LUAD19/00.maf/filtered_maf",
+                         pattern = "maf.gz$", full.names = TRUE)
+  guo_list = vector("list", length(guo_files))
+  for (i in seq_along(guo_files)) {
+    con = gzfile(guo_files[i], "rt")
+    d = read.delim(con, stringsAsFactors = FALSE, comment.char = "#")
+    guo_list[[i]] = d[, c("Tumor_Sample_Barcode", "Hugo_Symbol", "Chromosome",
+                          "Start_Position", "End_Position", "Reference_Allele",
+                          "Tumor_Seq_Allele2", "Variant_Classification")]
+  }
+  guo_maf = do.call(rbind, guo_list)
+  guo_snv = data.frame(
+    Cohort = "Guo2026",
+    SampleID = normalise_guo_id(guo_maf$Tumor_Sample_Barcode),
+    Gene = guo_maf$Hugo_Symbol,
+    Chr = guo_maf$Chromosome,
+    Start = guo_maf$Start_Position,
+    End = guo_maf$End_Position,
+    Ref = guo_maf$Reference_Allele,
+    Alt = guo_maf$Tumor_Seq_Allele2,
+    VariantType = guo_maf$Variant_Classification,
+    stringsAsFactors = FALSE)
+  guo_snv$VariantClass = classify_maf(guo_snv$VariantType)
+# Restricted: shipped separately under controlled access, not in the public data/.
+  write.csv(guo_snv, "../data/Guo2026_snv.csv", row.names = FALSE)
+
+  guo_nonsyn = guo_snv[guo_snv$VariantClass == "protein_altering", ]
+  guo_counts = as.data.frame(table(guo_nonsyn$SampleID), stringsAsFactors = FALSE)
+  colnames(guo_counts) = c("SampleID", "NonsynonymousMutation")
+  guo_tmb = merge(guo_info[, c("Cohort", "SampleID")], guo_counts, by = "SampleID", all.x = TRUE)
+  guo_tmb$NonsynonymousMutation[is.na(guo_tmb$NonsynonymousMutation)] = 0
+  guo_tmb$NonsynonymousPerMb = guo_tmb$NonsynonymousMutation / exome_size_mb
+  guo_tmb$TMBSource = "recomputed"
+  write.csv(guo_tmb, "../data/Guo2026_tmb.csv", row.names = FALSE)
+```
+
+## 2.5 TCGA2014 (Western, n = 595)
+
+`race.demographic` is carried through for R2-2. Coordinates are hg38.
+
+```{r tcga2014}
+  tcga_clinical = fread("../raw/TCGA2014_LUAD/TCGA-LUAD.clinical.tsv.gz",
+                        data.table = FALSE, showProgress = FALSE)
+  tcga_clinical = tcga_clinical[tcga_clinical[["sample_type.samples"]] == "Primary Tumor", ]
+  tcga_clinical = tcga_clinical[!duplicated(tcga_clinical$sample), ]
+
+  tcga_cig = suppressWarnings(as.numeric(tcga_clinical[["cigarettes_per_day.exposures"]]))
+  tcga_pack = suppressWarnings(as.numeric(tcga_clinical[["pack_years_smoked.exposures"]]))
+  tcga_years = suppressWarnings(as.numeric(tcga_clinical[["years_smoked.exposures"]]))
+  tcga_smoking = rep("Never", nrow(tcga_clinical))
+  tcga_ever = (!is.na(tcga_cig) & tcga_cig > 0) | (!is.na(tcga_pack) & tcga_pack > 0) |
+              (!is.na(tcga_years) & tcga_years > 0)
+  tcga_smoking[tcga_ever] = "Ever"
+
+  tcga_info = data.frame(
+    Cohort = "TCGA2014",
+    SampleID = tcga_clinical$sample,
+    Gender = tcga_clinical[["gender.demographic"]],
+    AgeGroup = NA_character_,
+    AgeNumeric = round(as.numeric(tcga_clinical[["age_at_diagnosis.diagnoses"]]) / 365.25, 1),
+    Smoking = tcga_smoking,
+    ReportedRace = tcga_clinical[["race.demographic"]],
+    stringsAsFactors = FALSE)
+  tcga_info$Gender[tcga_info$Gender == "female"] = "Female"
+  tcga_info$Gender[tcga_info$Gender == "male"] = "Male"
+  tcga_info$ReportedRace[is.na(tcga_info$ReportedRace) | tcga_info$ReportedRace == ""] = "not reported"
+  write.csv(tcga_info, "../data/TCGA2014_info.csv", row.names = FALSE)
+
+  tcga_raw = fread("../raw/TCGA2014_LUAD/TCGA-LUAD.somaticmutation_wxs.tsv.gz",
+                   data.table = FALSE, showProgress = FALSE)
+  tcga_snv = data.frame(
+    Cohort = "TCGA2014",
+    SampleID = tcga_raw$sample,
+    Gene = tcga_raw$gene,
+    Chr = tcga_raw$chrom,
+    Start = tcga_raw$start,
+    End = tcga_raw$end,
+    Ref = tcga_raw$ref,
+    Alt = tcga_raw$alt,
+    VariantType = tcga_raw$effect,
+    stringsAsFactors = FALSE)
+  tcga_snv$VariantClass = classify_vep(tcga_snv$VariantType)
+  tcga_snv = tcga_snv[tcga_snv$SampleID %in% tcga_info$SampleID, ]
+  write.csv(tcga_snv, "../data/TCGA2014_snv.csv", row.names = FALSE)
+
+  tcga_nonsyn = tcga_snv[tcga_snv$VariantClass == "protein_altering", ]
+  tcga_counts = as.data.frame(table(tcga_nonsyn$SampleID), stringsAsFactors = FALSE)
+  colnames(tcga_counts) = c("SampleID", "NonsynonymousMutation")
+  tcga_tmb = merge(tcga_info[, c("Cohort", "SampleID")], tcga_counts, by = "SampleID", all.x = TRUE)
+  tcga_tmb$NonsynonymousMutation[is.na(tcga_tmb$NonsynonymousMutation)] = 0
+  tcga_tmb$NonsynonymousPerMb = tcga_tmb$NonsynonymousMutation / exome_size_mb
+  tcga_tmb$TMBSource = "recomputed"
+  write.csv(tcga_tmb, "../data/TCGA2014_tmb.csv", row.names = FALSE)
+```
+
+## 2.6 TRACERx2023 (Western, n = 248)
+
+Two mutation tables ship with TRACERx. The **tumour-level** table is used;
+the region-level table (1,403,378 rows) is not. This was verified: for the 248
+LUAD tumours the tumour-level table gives 220,798 rows and 220,798 unique
+`tumour_id` + locus keys, i.e. no multi-region duplication.
+
+`func` is retained so that non-exonic variants are classified rather than
+dropped to `NA` as in the earlier pipeline. Coordinates are hg19.
+
+```{r tracerx2023}
+  tracerx_tumour = readRDS("../raw/TRACERx2023_LUAD421/20221109_TRACERx421_all_tumour_df.rds")
+  tracerx_luad = tracerx_tumour[tracerx_tumour$histology_3 == "LUAD", ]
+  tracerx_info = data.frame(
+    Cohort = "TRACERx2023",
+    SampleID = tracerx_luad$tumour_id_muttable_cruk,
+    Gender = tracerx_luad$clinical_sex,
+    AgeGroup = NA_character_,
+    AgeNumeric = as.numeric(tracerx_luad$age),
+    Smoking = standardize_smoking(tracerx_luad$smoking_status_merged),
+    ReportedRace = tracerx_luad$ethnicity,
+    stringsAsFactors = FALSE)
+  write.csv(tracerx_info, "../data/TRACERx2023_info.csv", row.names = FALSE)
+
+  tracerx_raw = read_fst("../raw/TRACERx2023_LUAD421/20221109_TRACERx421_mutation_table.fst",
+                         columns = c("tumour_id", "chr", "start", "stop", "ref", "var",
+                                     "Hugo_Symbol", "func", "exonic.func"))
+  tracerx_raw = tracerx_raw[tracerx_raw$tumour_id %in% tracerx_info$SampleID, ]
+  tracerx_snv = data.frame(
+    Cohort = "TRACERx2023",
+    SampleID = tracerx_raw$tumour_id,
+    Gene = tracerx_raw$Hugo_Symbol,
+    Chr = tracerx_raw$chr,
+    Start = tracerx_raw$start,
+    End = tracerx_raw$stop,
+    Ref = tracerx_raw$ref,
+    Alt = tracerx_raw$var,
+    VariantType = tracerx_raw$exonic.func,
+    RegionFunc = tracerx_raw$func,
+    stringsAsFactors = FALSE)
+  tracerx_snv$VariantClass = classify_annovar(tracerx_snv$RegionFunc, tracerx_snv$VariantType)
+  write.csv(tracerx_snv, "../data/TRACERx2023_snv.csv", row.names = FALSE)
+
+  tracerx_nonsyn = tracerx_snv[tracerx_snv$VariantClass == "protein_altering", ]
+  tracerx_counts = as.data.frame(table(tracerx_nonsyn$SampleID), stringsAsFactors = FALSE)
+  colnames(tracerx_counts) = c("SampleID", "NonsynonymousMutation")
+  tracerx_tmb = merge(tracerx_info[, c("Cohort", "SampleID")], tracerx_counts, by = "SampleID", all.x = TRUE)
+  tracerx_tmb$NonsynonymousMutation[is.na(tracerx_tmb$NonsynonymousMutation)] = 0
+  tracerx_tmb$NonsynonymousPerMb = tracerx_tmb$NonsynonymousMutation / exome_size_mb
+  tracerx_tmb$TMBSource = "recomputed"
+  write.csv(tracerx_tmb, "../data/TRACERx2023_tmb.csv", row.names = FALSE)
+```
+
+## 2.7 Variant class audit (answers R2-4)
+
+```{r variant-class-audit}
+  vc_cohorts = c("Chen2019", "Chen2020", "Xu2020", "Guo2026", "TCGA2014", "TRACERx2023")
+  vc_list = vector("list", length(vc_cohorts))
+  for (i in seq_along(vc_cohorts)) {
+    d = read.csv(paste0("../data/", vc_cohorts[i], "_snv.csv"), stringsAsFactors = FALSE)
+    tab = table(factor(d$VariantClass,
+                       levels = c("protein_altering", "silent", "noncoding", "unknown")))
+    vc_list[[i]] = data.frame(
+      Cohort = vc_cohorts[i],
+      ProteinAltering = as.integer(tab["protein_altering"]),
+      Silent = as.integer(tab["silent"]),
+      Noncoding = as.integer(tab["noncoding"]),
+      Unknown = as.integer(tab["unknown"]),
+      stringsAsFactors = FALSE)
+  }
+  variant_class_audit = do.call(rbind, vc_list)
+  variant_class_audit$NoncodingToProteinRatio =
+    round(variant_class_audit$Noncoding / variant_class_audit$ProteinAltering, 3)
+  write.csv(variant_class_audit, "../data/variant_class_audit.csv", row.names = FALSE)
+  variant_class_audit
+```
+
+# 3. Mutational signatures
+
+**The protein-altering restriction from R2-4 is deliberately not applied here.**
+Signature deconvolution requires the complete SBS96 spectrum; restricting to
+coding variants would distort the trinucleotide composition and invalidate the
+refit. Chen2019 is excluded because it has no full mutation table.
+
+```{r signature-functions}
+  complement_base = function(x) {
+    map = c("A" = "T", "T" = "A", "C" = "G", "G" = "C")
+    unname(map[toupper(x)])
+  }
+
+  make_sbs96_matrix = function(snv, genome_package) {
+    genome = BSgenome::getBSgenome(genome_package)
+    snv$Ref = toupper(as.character(snv$Ref))
+    snv$Alt = toupper(as.character(snv$Alt))
+    snv$Start = suppressWarnings(as.integer(snv$Start))
+    snv$Chr = gsub("^chr", "", as.character(snv$Chr), ignore.case = TRUE)
+    snv = snv[snv$Ref %in% c("A", "C", "G", "T") & snv$Alt %in% c("A", "C", "G", "T") &
+              !is.na(snv$Start), ]
+    genome_seqnames = as.character(GenomeInfoDb::seqnames(genome))
+    genome_chr = snv$Chr
+    prefixed = paste0("chr", genome_chr)
+    genome_chr[prefixed %in% genome_seqnames] = prefixed[prefixed %in% genome_seqnames]
+    snv$GenomeChr = genome_chr
+    snv = snv[snv$GenomeChr %in% genome_seqnames, ]
+    lens = GenomeInfoDb::seqlengths(genome)
+    snv = snv[snv$Start > 1 & snv$Start < as.numeric(lens[snv$GenomeChr]), ]
+    context = as.character(BSgenome::getSeq(genome, snv$GenomeChr,
+                                            start = snv$Start - 1, end = snv$Start + 1))
+    ok = toupper(substr(context, 2, 2)) == snv$Ref
+    snv = snv[ok, ]
+    context = context[ok]
+    ref = toupper(snv$Ref)
+    alt = toupper(snv$Alt)
+    left = substr(context, 1, 1)
+    right = substr(context, 3, 3)
+    rev_needed = ref %in% c("A", "G")
+    left_new = left
+    right_new = right
+    left_new[rev_needed] = complement_base(right[rev_needed])
+    right_new[rev_needed] = complement_base(left[rev_needed])
+    ref[rev_needed] = complement_base(ref[rev_needed])
+    alt[rev_needed] = complement_base(alt[rev_needed])
+    snv$SBS96 = paste0(left_new, "[", ref, ">", alt, "]", right_new)
+    mut_order = c("C>A", "C>G", "C>T", "T>A", "T>C", "T>G")
+    base_order = c("A", "C", "G", "T")
+    type_order = as.vector(outer(base_order, base_order, paste0))
+    sbs_order = unlist(lapply(mut_order, function(m)
+      paste0(substr(type_order, 1, 1), "[", m, "]", substr(type_order, 2, 2))))
+    tab = table(factor(snv$SBS96, levels = sbs_order), snv$SampleID)
+    out = as.data.frame.matrix(tab)
+    out$Type = rownames(out)
+    out[, c("Type", setdiff(names(out), "Type"))]
+  }
+
+  fit_sbs96_to_cosmic = function(sbs96_table, cosmic_path) {
+    cosmic = read.delim(cosmic_path, check.names = FALSE)
+    rownames(cosmic) = cosmic$Type
+    cosmic_matrix = as.matrix(cosmic[, setdiff(names(cosmic), "Type")])
+    rownames(sbs96_table) = sbs96_table$Type
+    spectrum = as.matrix(sbs96_table[, setdiff(names(sbs96_table), "Type")])
+    common = intersect(rownames(cosmic_matrix), rownames(spectrum))
+    fit = NMF::fcnnls(cosmic_matrix[common, , drop = FALSE], spectrum[common, , drop = FALSE])
+    w = as.data.frame(fit$x)
+    w$Signature = rownames(w)
+    w[, c("Signature", setdiff(names(w), "Signature"))]
+  }
+```
+
+```{r signatures}
+  cosmic37 = "../raw/reference/COSMIC_Human_SBS-96_GRCh37_v3.6.tsv"
+  cosmic38 = "../raw/reference/COSMIC_Human_SBS-96_GRCh38_v3.6.tsv"
+  sig_cohorts = c("Chen2020", "Xu2020", "Guo2026", "TRACERx2023", "TCGA2014")
+  sig_genomes = c("BSgenome.Hsapiens.UCSC.hg19", "BSgenome.Hsapiens.UCSC.hg19",
+                  "BSgenome.Hsapiens.UCSC.hg38", "BSgenome.Hsapiens.UCSC.hg19",
+                  "BSgenome.Hsapiens.UCSC.hg38")
+  sig_cosmic = c(cosmic37, cosmic37, cosmic38, cosmic37, cosmic38)
+
+  for (i in seq_along(sig_cohorts)) {
+    snv_i = read.csv(paste0("../data/", sig_cohorts[i], "_snv.csv"), stringsAsFactors = FALSE)
+    sbs96_i = make_sbs96_matrix(snv_i, sig_genomes[i])
+    write.csv(sbs96_i,
+              paste0("../data/signature/", sig_cohorts[i], "_spectrum96.csv"),
+              row.names = FALSE)
+    w_i = fit_sbs96_to_cosmic(sbs96_i, sig_cosmic[i])
+    write.csv(w_i,
+              paste0("../data/signature/", sig_cohorts[i], "_signature_weights.csv"),
+              row.names = FALSE)
+  }
+```
+
+Guo2026 is aligned to hg38 in the in-house pipeline; confirm this before the
+first full run. If the reference build is hg19, change `sig_genomes[3]` and
+`sig_cosmic[3]` accordingly.
+
+# 4. Frozen analysis metadata
+
+One master table with flag columns. Every downstream script filters from this
+object so that sample counts stay consistent across scripts 01-05 (editor
+comment E-6).
+
+```{r frozen-metadata}
+  info_cohorts = c("Chen2019", "Chen2020", "Xu2020", "Guo2026", "TCGA2014", "TRACERx2023")
+  info_list = vector("list", length(info_cohorts))
+  for (i in seq_along(info_cohorts)) {
+    d = read.csv(paste0("../data/", info_cohorts[i], "_info.csv"), stringsAsFactors = FALSE)
+    if (!"ReportedRace" %in% names(d)) d$ReportedRace = NA_character_
+    info_list[[i]] = d[, c("Cohort", "SampleID", "Gender", "AgeGroup", "AgeNumeric",
+                           "Smoking", "ReportedRace")]
+  }
+  meta = do.call(rbind, info_list)
+  meta$CohortGroup = "EAS"
+  meta$CohortGroup[meta$Cohort %in% c("TCGA2014", "TRACERx2023")] = "Western"
+
+# --- R2-2 ancestry exclusion -------------------------------------------------
+  race_lower = tolower(as.character(meta$ReportedRace))
+  meta$AncestryExcluded = !is.na(race_lower) & grepl("asian", race_lower)
+
+# --- data availability flags -------------------------------------------------
+  tmb_list = vector("list", length(info_cohorts))
+  for (i in seq_along(info_cohorts)) {
+    tmb_list[[i]] = read.csv(paste0("../data/", info_cohorts[i], "_tmb.csv"),
+                             stringsAsFactors = FALSE)[, c("SampleID", "NonsynonymousPerMb", "TMBSource")]
+  }
+  tmb_all = do.call(rbind, tmb_list)
+  meta = merge(meta, tmb_all, by = "SampleID", all.x = TRUE)
+  meta$HasTMB = !is.na(meta$NonsynonymousPerMb)
+
+  sig_samples = c()
+  for (i in seq_along(sig_cohorts)) {
+    s = read.csv(paste0("../data/signature/", sig_cohorts[i], "_signature_weights.csv"),
+                 stringsAsFactors = FALSE, check.names = FALSE)
+    sig_samples = c(sig_samples, setdiff(names(s), "Signature"))
+  }
+  meta$HasSignature = meta$SampleID %in% sig_samples
+
+# Chen2019 ships a curated driver list (227 rows / 154 samples), not a full MAF,
+# so it cannot enter driver-frequency or signature analyses.
+  meta$HasFullMAF = meta$Cohort != "Chen2019"
+
+# Cohorts with enough samples in both smoking strata for within-cohort and
+# cohort-pair analysis (scripts 02 and 04, Figure 1D).
+  meta$InPerCohortAnalysis = meta$Cohort %in% c("Chen2020", "Xu2020", "TCGA2014", "TRACERx2023")
+
+  write.csv(meta, "../data/analysis_metadata.csv", row.names = FALSE)
+
+  cell_counts = table(meta$CohortGroup, meta$Smoking)
+  cell_counts
+```
+
+# 5. Hypermutation flag (answers R2-1)
+
+Hypermutated tumours are **flagged and retained**. Scripts 01-04 run on the
+full data; 05_sensitivity re-runs them with these tumours removed.
+
+A fixed TMB cut-off is biased in this design: TMB is far higher in the Western
+cohorts, so a threshold such as 10/Mb removes mostly Western ever-smokers, i.e.
+exactly the tumours that carry the smoking effect. A mechanism-based flag is
+therefore used as primary, with the conventional thresholds recorded alongside
+for reference.
+
+```{r hypermutation-flag}
+  pole_sigs = c("SBS10a", "SBS10b", "SBS10c", "SBS10d", "SBS28")
+  mmr_sigs  = c("SBS6", "SBS14", "SBS15", "SBS20", "SBS21", "SBS26", "SBS44")
+  apobec_sigs = c("SBS2", "SBS13")
+
+  hyper_list = vector("list", length(sig_cohorts))
+  for (i in seq_along(sig_cohorts)) {
+    w = read.csv(paste0("../data/signature/", sig_cohorts[i], "_signature_weights.csv"),
+                 stringsAsFactors = FALSE, check.names = FALSE)
+    rownames(w) = w$Signature
+    m = as.matrix(w[, setdiff(names(w), "Signature"), drop = FALSE])
+    total = colSums(m)
+    total[total == 0] = NA
+    frac = function(sigs) {
+      present = intersect(sigs, rownames(m))
+      if (length(present) == 0) return(rep(0, ncol(m)))
+      colSums(m[present, , drop = FALSE]) / total
+    }
+    hyper_list[[i]] = data.frame(
+      SampleID = colnames(m),
+      PoleFraction = as.numeric(frac(pole_sigs)),
+      MmrFraction = as.numeric(frac(mmr_sigs)),
+      ApobecFraction = as.numeric(frac(apobec_sigs)),
+      stringsAsFactors = FALSE)
+  }
+  hyper = do.call(rbind, hyper_list)
+  hyper$HypermutationMechanism = "none"
+  hyper$HypermutationMechanism[!is.na(hyper$ApobecFraction) & hyper$ApobecFraction > 0.50] = "APOBEC"
+  hyper$HypermutationMechanism[!is.na(hyper$MmrFraction) & hyper$MmrFraction > 0.20] = "MMR"
+  hyper$HypermutationMechanism[!is.na(hyper$PoleFraction) & hyper$PoleFraction > 0.20] = "POLE"
+  hyper$HypermutatedMechanism = hyper$HypermutationMechanism != "none"
+
+  meta = merge(meta, hyper, by = "SampleID", all.x = TRUE)
+  meta$HypermutatedTMB10 = !is.na(meta$NonsynonymousPerMb) & meta$NonsynonymousPerMb >= 10
+  meta$HypermutatedTMB20 = !is.na(meta$NonsynonymousPerMb) & meta$NonsynonymousPerMb >= 20
+
+# cohort-internal extreme threshold: Q3 + 3 x IQR, computed within each cohort
+  meta$HypermutatedCohortExtreme = FALSE
+  for (co in unique(meta$Cohort)) {
+    idx = meta$Cohort == co & !is.na(meta$NonsynonymousPerMb)
+    v = meta$NonsynonymousPerMb[idx]
+    if (length(v) < 10) next
+    cutoff = quantile(v, 0.75) + 3 * IQR(v)
+    meta$HypermutatedCohortExtreme[idx] = v > cutoff
+  }
+
+  write.csv(meta, "../data/analysis_metadata.csv", row.names = FALSE)
+
+  hyper_audit = data.frame(
+    Definition = c("mechanism (POLE/MMR/APOBEC)", "TMB >= 10", "TMB >= 20", "cohort Q3+3IQR"),
+    N = c(sum(meta$HypermutatedMechanism, na.rm = TRUE),
+          sum(meta$HypermutatedTMB10), sum(meta$HypermutatedTMB20),
+          sum(meta$HypermutatedCohortExtreme)),
+    stringsAsFactors = FALSE)
+  write.csv(hyper_audit, "../data/hypermutation_audit.csv", row.names = FALSE)
+  hyper_audit
+```
+
+# 6. Session information
+
+```{r session}
+  writeLines(capture.output(sessionInfo()), "../data/sessionInfo.txt")
+  sessionInfo()
+```

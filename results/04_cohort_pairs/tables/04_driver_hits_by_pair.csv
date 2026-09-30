@@ -1,0 +1,13 @@
+"cohort_a","cohort_b","pair_class","smoking","n_tested","n_significant"
+"Chen2020","TCGA2014","cross-ancestry","Ever",7908,58
+"Chen2020","TRACERx2023","cross-ancestry","Ever",7703,61
+"Xu2020","TCGA2014","cross-ancestry","Ever",7659,28
+"Xu2020","TRACERx2023","cross-ancestry","Ever",7389,5
+"Chen2020","TCGA2014","cross-ancestry","Never",5038,59
+"Chen2020","TRACERx2023","cross-ancestry","Never",939,1
+"Xu2020","TCGA2014","cross-ancestry","Never",4553,9
+"Xu2020","TRACERx2023","cross-ancestry","Never",394,0
+"Chen2020","Xu2020","within-EAS","Ever",2667,0
+"Chen2020","Xu2020","within-EAS","Never",1271,2
+"TCGA2014","TRACERx2023","within-Western","Ever",8331,373
+"TCGA2014","TRACERx2023","within-Western","Never",4283,0

@@ -1,0 +1,286 @@
+---
+title: "04 - Pairwise cohort analysis with within-ancestry negative controls"
+author: "Shuai Guo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+Every estimate here is computed from **exactly two cohorts**, so no pooling of
+heterogeneous datasets contributes to any point.
+
+The four cohorts with enough tumours in both smoking strata give six pairs:
+four cross-ancestry and two within-ancestry. The within-ancestry pairs are
+**negative controls**. A technical difference between two independently
+processed datasets should appear in any pair, whereas an ancestry effect should
+appear only when the pair spans the ancestry boundary. This answers R1-1 and
+R2-6 without requiring us to model technical variables the cohorts do not report.
+
+The test is deliberately falsifiable and is expected to reject endpoints that
+depend on absolute mutation counts.
+
+**A note on power.** With four cross-ancestry and two within-ancestry pairs the
+smallest attainable two-sided rank-sum P value is 2/15 = 0.133, so this test
+cannot reach P < 0.05 by construction. Complete separation, meaning the smallest
+cross-ancestry absolute effect exceeds the largest within-ancestry one, is the
+informative statistic; the P value is not.
+
+```{r setup}
+  knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+  library(data.table)
+  library(ggplot2)
+  library(ggrepel)
+  library(patchwork)
+  source("_functions.R")
+
+  dir.create("../results/04_cohort_pairs/tables", showWarnings = FALSE, recursive = TRUE)
+  dir.create("../results/04_cohort_pairs/figures", showWarnings = FALSE, recursive = TRUE)
+  dir.create("../results/figure1_panels", showWarnings = FALSE, recursive = TRUE)
+
+  n_boot = 2000
+  set.seed(20260809)
+
+  meta = load_metadata(drop_ancestry = TRUE, drop_hyper = FALSE)
+  meta = meta[meta$Cohort %in% PER_COHORT_SET, ]
+  cohorts = PER_COHORT_SET
+  cohort_group = c(Chen2020 = "EAS", Xu2020 = "EAS",
+                   TCGA2014 = "Western", TRACERx2023 = "Western")
+
+  pair_a = c()
+  pair_b = c()
+  for (i in 1:(length(cohorts) - 1)) {
+    for (j in (i + 1):length(cohorts)) {
+      a = cohorts[i]
+      b = cohorts[j]
+      if (cohort_group[a] == "Western" && cohort_group[b] == "EAS") {
+        a = cohorts[j]
+        b = cohorts[i]
+      }
+      pair_a = c(pair_a, a)
+      pair_b = c(pair_b, b)
+    }
+  }
+  pair_class = rep("cross-ancestry", length(pair_a))
+  same = cohort_group[pair_a] == cohort_group[pair_b]
+  pair_class[same] = paste0("within-", cohort_group[pair_a][same])
+  data.frame(pair_a, pair_b, pair_class)
+
+  sig_wide = load_signature_relative()
+  sig_meta = merge(meta, sig_wide, by = "SampleID")
+  sig_list = active_signatures(sig_wide)
+  point_class = load_point_mutation_classes()
+  point_meta = merge(meta, point_class, by = "SampleID")
+  classes = c("C>A", "C>G", "C>T", "T>A", "T>C", "T>G")
+```
+
+# 1. Pairwise difference in differences, every continuous layer
+
+The EAS cohort is placed first in cross-ancestry pairs, so a positive value
+means the Western cohort has the steeper response to smoking.
+
+```{r pairwise-did}
+  pw = NULL
+  for (k in seq_along(pair_a)) {
+    a = pair_a[k]
+    b = pair_b[k]
+    d = meta[meta$HasTMB, ]
+    r = pairwise_did(d$NonsynonymousPerMb, d$Cohort, d$Smoking, a, b, "TMB", n_boot)
+    if (!is.null(r)) {
+      r$layer = "TMB"
+      r$pair_class = pair_class[k]
+      pw = rbind(pw, r)
+    }
+    for (i in seq_along(sig_list)) {
+      r = pairwise_did(sig_meta[[sig_list[i]]], sig_meta$Cohort, sig_meta$Smoking,
+                       a, b, sig_list[i], n_boot)
+      if (!is.null(r)) {
+        r$layer = "signature"
+        r$pair_class = pair_class[k]
+        pw = rbind(pw, r)
+      }
+    }
+    for (i in seq_along(classes)) {
+      r = pairwise_did(point_meta[[classes[i]]], point_meta$Cohort,
+                       point_meta$Smoking, a, b, classes[i], n_boot)
+      if (!is.null(r)) {
+        r$layer = "substitution class"
+        r$pair_class = pair_class[k]
+        pw = rbind(pw, r)
+      }
+    }
+  }
+  pw$p_adjusted = NA
+  feats = unique(pw$feature)
+  for (i in seq_along(feats)) {
+    rows = pw$feature == feats[i]
+    pw$p_adjusted[rows] = p.adjust(pw$p_bootstrap[rows], method = "BH")
+  }
+  write.csv(pw, "../results/04_cohort_pairs/tables/01_pairwise_did.csv",
+            row.names = FALSE)
+  cat("pairwise estimates:", nrow(pw), " over", length(feats), "features\n")
+  pw[pw$feature == "SBS4", c("cohort_a", "cohort_b", "pair_class", "delta_a",
+                             "delta_b", "did", "ci_low", "ci_high", "p_adjusted")]
+```
+
+# 2. Do cross-ancestry and within-ancestry pairs separate?
+
+```{r separation}
+  sep = NULL
+  for (i in seq_along(feats)) {
+    d = pw[pw$feature == feats[i], ]
+    cross = abs(d$did[d$pair_class == "cross-ancestry"])
+    within = abs(d$did[d$pair_class != "cross-ancestry"])
+    if (length(cross) < 2 || length(within) < 1) {
+      next
+    }
+    layer = d$layer[1]
+    tst = wilcox.test(cross, within)
+    sep = rbind(sep, data.frame(feature = feats[i], layer = layer,
+      n_cross = length(cross), n_within = length(within),
+      median_cross = median(cross), median_within = median(within),
+      min_cross = min(cross), max_within = max(within),
+      complete_separation = min(cross) > max(within),
+      p_value = tst$p.value, stringsAsFactors = FALSE))
+  }
+  sep = sep[order(-sep$complete_separation, -sep$median_cross), ]
+  write.csv(sep, "../results/04_cohort_pairs/tables/02_class_separation.csv",
+            row.names = FALSE)
+  cat("features with complete separation:", sum(sep$complete_separation), "of",
+      nrow(sep), "\n")
+  sep[sep$complete_separation | sep$feature %in% c("TMB", "SBS1", "SBS4", "C>A"), ]
+```
+
+```{r separation-figure}
+  pw$class2 = "within-ancestry"
+  pw$class2[pw$pair_class == "cross-ancestry"] = "cross-ancestry"
+  pw$abs_did = abs(pw$did)
+  scaled = rep(NA, nrow(pw))
+  for (i in seq_along(feats)) {
+    rows = pw$feature == feats[i]
+    mx = max(pw$abs_did[rows], na.rm = TRUE)
+    if (mx > 0) {
+      scaled[rows] = pw$abs_did[rows] / mx
+    }
+  }
+  pw$scaled = scaled
+  show = pw[pw$feature %in% c("TMB", "SBS4", "SBS1", "SBS2", "SBS13", "C>A",
+                              "C>T", "T>C"), ]
+  ordf = sep$feature[sep$feature %in% show$feature]
+  show$feature = factor(show$feature, levels = ordf)
+  p_sep = ggplot(show, aes(x = feature, y = scaled, colour = class2))
+  p_sep = p_sep + geom_point(position = position_jitterdodge(jitter.width = 0.1,
+                                                            dodge.width = 0.55),
+                             size = 2, alpha = 0.9)
+  p_sep = p_sep + scale_colour_manual(values = c("cross-ancestry" = "#C0392B",
+                                                 "within-ancestry" = "#3B6FB6"),
+                                      name = NULL)
+  p_sep = p_sep + labs(x = NULL,
+                       y = "absolute DiD, scaled to the maximum for that feature",
+                       title = "Only endpoints that respect the ancestry boundary separate")
+  p_sep = p_sep + theme_pub()
+  p_sep = p_sep + theme(legend.position = "top")
+  ggsave("../results/04_cohort_pairs/figures/class_separation.pdf", p_sep,
+         width = 6, height = 3.6, device = cairo_pdf)
+  p_sep
+```
+
+```{r pairwise-forest}
+  show = pw[pw$feature %in% c("SBS4", "TMB", "C>A", "SBS1", "SBS13"), ]
+  show$pair = paste(sub("2014|2019|2020|2023", "", show$cohort_a),
+                    sub("2014|2019|2020|2023", "", show$cohort_b), sep = " / ")
+  ord = show$pair[show$feature == "SBS4"][order(show$did[show$feature == "SBS4"])]
+  show$pair = factor(show$pair, levels = ord)
+  show$feature = factor(show$feature, levels = c("SBS4", "C>A", "TMB", "SBS1", "SBS13"))
+  p_pw = forest_plot(show, "did", "ci_low", "ci_high", "pair", "pair_class",
+                     CLASS_COLS, "difference in differences (95% CI)",
+                     "Every estimate uses exactly two cohorts; within-ancestry pairs are controls")
+  p_pw = p_pw + facet_wrap(~ feature, scales = "free_x", nrow = 1)
+  ggsave("../results/04_cohort_pairs/figures/pairwise_forest.pdf", p_pw,
+         width = 10, height = 3.2, device = cairo_pdf)
+  p_pw
+```
+
+# 3. Driver genes, pairwise within each smoking stratum (Figure 1D, right)
+
+```{r pairwise-drivers}
+  driver_meta = meta[meta$HasFullMAF, ]
+  snv_pa = load_protein_altering(cohorts)
+  gene_tab = table(snv_pa$Gene[snv_pa$SampleID %in% driver_meta$SampleID])
+  test_genes = names(gene_tab)[gene_tab >= MIN_GENE_MUTATED]
+  cat("genes tested per pair per stratum:", length(test_genes), "\n")
+
+  pwd = NULL
+  for (k in seq_along(pair_a)) {
+    a = pair_a[k]
+    b = pair_b[k]
+    for (sm in c("Never", "Ever")) {
+      da = driver_meta[driver_meta$Cohort == a & driver_meta$Smoking == sm, ]
+      db = driver_meta[driver_meta$Cohort == b & driver_meta$Smoking == sm, ]
+      if (nrow(da) < 10 || nrow(db) < 10) {
+        next
+      }
+      for (i in seq_along(test_genes)) {
+        ha = da$SampleID %in% snv_pa$SampleID[snv_pa$Gene == test_genes[i]]
+        hb = db$SampleID %in% snv_pa$SampleID[snv_pa$Gene == test_genes[i]]
+        if (sum(ha) + sum(hb) < 3) {
+          next
+        }
+        tab = matrix(c(sum(ha), length(ha) - sum(ha),
+                       sum(hb), length(hb) - sum(hb)), nrow = 2)
+        odds = ((sum(ha) + 0.5) * (length(hb) - sum(hb) + 0.5))
+        odds = odds / ((length(ha) - sum(ha) + 0.5) * (sum(hb) + 0.5))
+        pwd = rbind(pwd, data.frame(feature = test_genes[i], smoking = sm,
+          cohort_a = a, cohort_b = b, pair_class = pair_class[k],
+          n_a = length(ha), freq_a = mean(ha),
+          n_b = length(hb), freq_b = mean(hb),
+          log2_odds_ratio = log2(odds), p_value = fisher.test(tab)$p.value,
+          stringsAsFactors = FALSE))
+      }
+    }
+  }
+  pwd$p_adjusted = p.adjust(pwd$p_value, method = "BH")
+  write.csv(pwd, "../results/04_cohort_pairs/tables/03_pairwise_driver.csv",
+            row.names = FALSE)
+
+  tally = NULL
+  keys = unique(paste(pwd$cohort_a, pwd$cohort_b, pwd$smoking))
+  for (i in seq_along(keys)) {
+    parts = strsplit(keys[i], " ")[[1]]
+    d = pwd[pwd$cohort_a == parts[1] & pwd$cohort_b == parts[2] &
+            pwd$smoking == parts[3], ]
+    tally = rbind(tally, data.frame(cohort_a = parts[1], cohort_b = parts[2],
+      pair_class = d$pair_class[1], smoking = parts[3], n_tested = nrow(d),
+      n_significant = sum(d$p_adjusted < 0.05, na.rm = TRUE),
+      stringsAsFactors = FALSE))
+  }
+  tally = tally[order(tally$pair_class, tally$smoking), ]
+  write.csv(tally, "../results/04_cohort_pairs/tables/04_driver_hits_by_pair.csv",
+            row.names = FALSE)
+  tally
+```
+
+```{r pairwise-driver-figure}
+  show = pwd[pwd$feature %in% c("EGFR", "KRAS", "KEAP1", "TP53", "STK11"), ]
+  show$pair = paste(sub("2014|2019|2020|2023", "", show$cohort_a),
+                    sub("2014|2019|2020|2023", "", show$cohort_b), sep = " / ")
+  show$sig = show$p_adjusted < 0.05
+  p_pd = ggplot(show, aes(x = log2_odds_ratio, y = pair, colour = pair_class))
+  p_pd = p_pd + geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.3,
+                           colour = "grey40")
+  p_pd = p_pd + geom_point(aes(shape = sig), size = 2.1)
+  p_pd = p_pd + facet_grid(smoking ~ feature)
+  p_pd = p_pd + scale_colour_manual(values = CLASS_COLS, name = NULL)
+  p_pd = p_pd + scale_shape_manual(values = c("TRUE" = 16, "FALSE" = 1),
+                                   labels = c("ns", "adj P < 0.05"), name = NULL)
+  p_pd = p_pd + labs(x = expression(log[2] * " odds ratio"), y = NULL,
+                     title = "Driver differences appear only across the ancestry boundary")
+  p_pd = p_pd + theme_pub()
+  p_pd = p_pd + theme(legend.position = "top")
+  ggsave("../results/figure1_panels/fig1d_right_cohort_pairs.pdf", p_pd,
+         width = 9, height = 4, device = cairo_pdf)
+  p_pd
+```
+
+```{r session}
+  sessionInfo()
+```

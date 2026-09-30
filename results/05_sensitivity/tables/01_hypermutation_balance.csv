@@ -1,0 +1,17 @@
+"definition","cell","n_cell","n_flagged","pct_flagged"
+"mechanism (POLE/MMR/APOBEC)","EAS Never",420,58,13.8
+"mechanism (POLE/MMR/APOBEC)","EAS Ever",200,16,8
+"mechanism (POLE/MMR/APOBEC)","Western Never",239,27,11.3
+"mechanism (POLE/MMR/APOBEC)","Western Ever",594,58,9.8
+"TMB >= 10","EAS Never",420,2,0.5
+"TMB >= 10","EAS Ever",200,32,16
+"TMB >= 10","Western Never",239,27,11.3
+"TMB >= 10","Western Ever",594,172,29
+"TMB >= 20","EAS Never",420,0,0
+"TMB >= 20","EAS Ever",200,6,3
+"TMB >= 20","Western Never",239,8,3.3
+"TMB >= 20","Western Ever",594,52,8.8
+"cohort Q3 + 3 IQR","EAS Never",420,6,1.4
+"cohort Q3 + 3 IQR","EAS Ever",200,41,20.5
+"cohort Q3 + 3 IQR","Western Never",239,5,2.1
+"cohort Q3 + 3 IQR","Western Ever",594,15,2.5

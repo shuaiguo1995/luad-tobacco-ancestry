@@ -1,0 +1,9 @@
+"Cohort","CohortGroup","Smoking","n_total","n_noncoding"
+"Chen2020","EAS","Ever",194,92
+"Xu2020","EAS","Ever",176.5,28
+"TCGA2014","Western","Ever",258,6
+"TRACERx2023","Western","Ever",710,317
+"Chen2020","EAS","Never",113,51
+"Xu2020","EAS","Never",83,11
+"TCGA2014","Western","Never",126,3
+"TRACERx2023","Western","Never",199,83

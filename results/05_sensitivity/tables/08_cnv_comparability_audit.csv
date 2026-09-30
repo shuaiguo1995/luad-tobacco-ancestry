@@ -1,0 +1,7 @@
+"cohort","level","quantification","genome_build","used_here"
+"Chen2020","sample","GISTIC discrete -2..2","hg19",TRUE
+"TCGA2014","sample","ASCAT2 absolute integer copy number","hg38",TRUE
+"TRACERx2023","sample","GISTIC peak calls, AMP/DEL, clonal/subclonal","hg19",TRUE
+"Guo2026","sample","segment-level gain/loss with LOH, encoding undocumented","hg38",FALSE
+"Xu2020","aggregate","published gene by tumour counts","unknown",FALSE
+"Chen2019","aggregate","published arm-level frequencies, two rows","unknown",FALSE

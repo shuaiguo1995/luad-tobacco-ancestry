@@ -1,0 +1,2 @@
+"feature","n_eas_never","n_eas_ever","n_west_never","n_west_ever","median_eas_never","median_eas_ever","median_west_never","median_west_ever","delta_eas","delta_western","did","ci_low","ci_high","p_bootstrap"
+"TMB",398,190,239,594,1.28947368421053,2.38568414707655,2.18421052631579,5.96052631578948,1.09621046286602,3.77631578947369,2.68010532660767,1.80384163904507,3.65449641184328,0.000499750124937531

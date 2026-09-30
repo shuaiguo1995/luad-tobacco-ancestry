@@ -1,0 +1,9 @@
+"cohort","cohort_group","smoking","n","pct_sbs4_above_10","median_sbs4"
+"Chen2020","EAS","Never",187,4.8,0
+"Chen2020","EAS","Ever",111,48.6,0.0818
+"Xu2020","EAS","Never",77,2.6,0
+"Xu2020","EAS","Ever",26,46.2,0.0452
+"TCGA2014","Western","Never",195,45.6,0.0416
+"TCGA2014","Western","Ever",366,69.1,0.2821
+"TRACERx2023","Western","Never",25,8,0
+"TRACERx2023","Western","Ever",221,71.9,0.3059

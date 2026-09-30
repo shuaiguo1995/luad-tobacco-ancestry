@@ -1,0 +1,508 @@
+---
+title: "01 Four groups: ancestry by smoking (Figure 1A-C)"
+author: "Shuai Guo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+Primary analysis and the source of Figure 1A-C. All six cohorts pooled into a
+two by two factorial design: ancestry (EAS / Western) crossed with smoking
+(Never / Ever).
+
+Every data layer is analysed with the same five contrasts:
+
+1. ancestry within never-smokers
+2. ancestry within ever-smokers
+3. smoking within EAS
+4. smoking within Western
+5. **EAS ever-smokers versus Western never-smokers** - if these cannot be
+   distinguished, "never-smoker" is not a comparable category across the two
+   populations
+
+plus a difference in differences for the interaction. Nothing is restricted to a
+hand-picked feature set: the driver scan is genome-wide and the signature scan
+covers every COSMIC v3.6 signature active in the data.
+
+The Figure 1 source panels are written to `results/figure1_panels/`; every
+other table and figure goes to `results/01_four_groups/`.
+
+```{r setup}
+  knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+  library(data.table)
+  library(ggplot2)
+  library(ggrepel)
+  library(patchwork)
+  library(nlme)
+  source("_functions.R")
+
+  dir.create("../results/01_four_groups/tables", showWarnings = FALSE, recursive = TRUE)
+  dir.create("../results/01_four_groups/figures", showWarnings = FALSE, recursive = TRUE)
+  dir.create("../results/figure1_panels", showWarnings = FALSE, recursive = TRUE)
+
+  n_boot = 2000
+  set.seed(20260809)
+
+  meta = load_metadata(drop_ancestry = TRUE, drop_hyper = FALSE)
+  sig_wide = load_signature_relative()
+  sig_meta = merge(meta, sig_wide, by = "SampleID")
+  point_class = load_point_mutation_classes()
+  point_meta = merge(meta, point_class, by = "SampleID")
+  tmb_meta = meta[meta$HasTMB, ]
+  sig_list = active_signatures(sig_wide)
+  cat("tumours:", nrow(meta), "  with TMB:", nrow(tmb_meta),
+      "  with signature refit:", nrow(sig_meta),
+      "  active signatures:", length(sig_list), "\n")
+```
+
+# 1. Cohort composition (Figure 1A, left)
+
+```{r composition}
+  cell_counts = as.data.frame.matrix(table(meta$Cohort, meta$Cell))
+  cell_counts$total = rowSums(cell_counts)
+  write.csv(cell_counts, "../results/01_four_groups/tables/01_cell_counts.csv")
+  cell_counts
+
+  comp = as.data.frame(table(meta$Cohort, meta$Cell))
+  names(comp) = c("Cohort", "Cell", "n")
+  comp = comp[comp$n > 0, ]
+  p_comp = ggplot(comp, aes(x = Cohort, y = n, fill = Cell))
+  p_comp = p_comp + geom_col(width = 0.7)
+  p_comp = p_comp + scale_fill_manual(values = CELL_COLS, name = NULL)
+  p_comp = p_comp + coord_flip()
+  p_comp = p_comp + labs(x = NULL, y = "tumours",
+                         title = "Study design: six cohorts across four analysis cells")
+  p_comp = p_comp + theme_pub()
+  ggsave("../results/figure1_panels/fig1a_left_cohort_composition.pdf", p_comp,
+         width = 5.5, height = 3, device = cairo_pdf)
+  p_comp
+```
+
+```{r clinical-tests}
+  age_ok = meta[!is.na(meta$AgeNumeric), ]
+  age_contrasts = contrasts_continuous(age_ok$AgeNumeric, age_ok$CohortGroup,
+                                       age_ok$Smoking, "age")
+  age_contrasts = adjust_within_contrast(age_contrasts)
+  write.csv(age_contrasts, "../results/01_four_groups/tables/02a_age_contrasts.csv",
+            row.names = FALSE)
+
+  female = meta$Gender == "Female"
+  sex_contrasts = contrasts_binary(female, meta$CohortGroup, meta$Smoking, "female")
+  sex_contrasts = adjust_within_contrast(sex_contrasts)
+  write.csv(sex_contrasts, "../results/01_four_groups/tables/02b_sex_contrasts.csv",
+            row.names = FALSE)
+  age_contrasts[, c("contrast", "n_a", "n_b", "median_a", "median_b", "p_adjusted")]
+  sex_contrasts[, c("contrast", "n_a", "n_b", "freq_a", "freq_b", "p_adjusted")]
+```
+
+# 2. Tumour mutation burden (Figure 1A, right)
+
+```{r tmb}
+  tmb_contrasts = contrasts_continuous(tmb_meta$NonsynonymousPerMb,
+                                       tmb_meta$CohortGroup, tmb_meta$Smoking, "TMB")
+  tmb_contrasts = adjust_within_contrast(tmb_contrasts)
+  write.csv(tmb_contrasts, "../results/01_four_groups/tables/03_tmb_contrasts.csv", row.names = FALSE)
+
+  tmb_did = did_medians(tmb_meta$NonsynonymousPerMb, tmb_meta$CohortGroup,
+                        tmb_meta$Smoking, "TMB", n_boot)
+  tmb_model = did_models(log10(tmb_meta$NonsynonymousPerMb + 0.01),
+                         tmb_meta$CohortGroup, tmb_meta$Smoking,
+                         tmb_meta$Cohort, "log10 TMB")
+  write.csv(tmb_did, "../results/01_four_groups/tables/04_tmb_interaction.csv", row.names = FALSE)
+  write.csv(tmb_model, "../results/01_four_groups/tables/05_tmb_interaction_models.csv",
+            row.names = FALSE)
+  tmb_contrasts[, c("contrast", "n_a", "n_b", "median_a", "median_b", "p_adjusted")]
+  tmb_did[, c("delta_eas", "delta_western", "did", "ci_low", "ci_high", "p_bootstrap")]
+  tmb_model
+```
+
+```{r tmb-figure}
+  d = tmb_meta
+  d$y = d$NonsynonymousPerMb + 0.01
+  p_tmb = ggplot(d, aes(x = Cell, y = y, fill = Cell))
+  p_tmb = p_tmb + geom_violin(trim = FALSE, alpha = 0.45, linewidth = 0.3,
+                              scale = "width", show.legend = FALSE)
+  p_tmb = p_tmb + geom_jitter(width = 0.13, size = 0.35, alpha = 0.25,
+                              colour = "grey20", stroke = 0, show.legend = FALSE)
+  p_tmb = p_tmb + geom_boxplot(width = 0.16, outlier.shape = NA, alpha = 0.9,
+                               linewidth = 0.3, show.legend = FALSE)
+  p_tmb = p_tmb + scale_fill_manual(values = CELL_COLS)
+  p_tmb = p_tmb + scale_y_log10()
+  p_tmb = p_tmb + scale_x_discrete(labels = c("EAS\nnever", "EAS\never",
+                                              "West\nnever", "West\never"))
+  p_tmb = p_tmb + labs(x = NULL, y = "protein-altering mutations / Mb",
+                       title = "Tumour mutation burden across the four cells")
+  p_tmb = p_tmb + theme_pub()
+  ggsave("../results/figure1_panels/fig1a_right_tmb.pdf", p_tmb,
+         width = 4, height = 3.6, device = cairo_pdf)
+  p_tmb
+```
+
+# 3. Driver genes, genome-wide (Figure 1B)
+
+Every gene carrying a protein-altering variant in at least ten tumours is
+tested, in all five contrasts. Chen2019 is excluded because its mutation file is
+a curated driver list rather than a full exome table.
+
+```{r driver-scan}
+  driver_meta = meta[meta$HasFullMAF, ]
+  driver_cohorts = unique(driver_meta$Cohort)
+  snv_pa = load_protein_altering(driver_cohorts)
+  gene_tab = table(snv_pa$Gene[snv_pa$SampleID %in% driver_meta$SampleID])
+  test_genes = names(gene_tab)[gene_tab >= MIN_GENE_MUTATED]
+  cat("genes tested:", length(test_genes), "  tumours:", nrow(driver_meta), "\n")
+
+  driver_scan = NULL
+  for (i in seq_along(test_genes)) {
+    hit = driver_meta$SampleID %in% snv_pa$SampleID[snv_pa$Gene == test_genes[i]]
+    r = contrasts_binary(hit, driver_meta$CohortGroup, driver_meta$Smoking,
+                         test_genes[i])
+    driver_scan = rbind(driver_scan, r)
+  }
+  driver_scan = adjust_within_contrast(driver_scan)
+  write.csv(driver_scan, "../results/01_four_groups/tables/06_driver_genomewide.csv",
+            row.names = FALSE)
+
+  hits = NULL
+  for (cn in unique(driver_scan$contrast)) {
+    d = driver_scan[driver_scan$contrast == cn, ]
+    hits = rbind(hits, data.frame(contrast = cn, n_tested = nrow(d),
+      n_significant = sum(d$p_adjusted < 0.05, na.rm = TRUE),
+      eas_enriched = sum(d$p_adjusted < 0.05 & d$log2_odds_ratio > 0, na.rm = TRUE),
+      western_enriched = sum(d$p_adjusted < 0.05 & d$log2_odds_ratio < 0, na.rm = TRUE),
+      stringsAsFactors = FALSE))
+  }
+  write.csv(hits, "../results/01_four_groups/tables/07_driver_hit_counts.csv", row.names = FALSE)
+  hits
+```
+
+```{r driver-volcanoes}
+  contrast_files = c("ancestry within never-smokers" = "../results/figure1_panels/fig1b_bottom_never_smokers.pdf",
+                     "ancestry within ever-smokers" = "../results/figure1_panels/fig1b_bottom_ever_smokers.pdf",
+                     "smoking within EAS" = "../results/01_four_groups/figures/volcano_driver_smoking_eas.pdf",
+                     "smoking within Western" = "../results/01_four_groups/figures/volcano_driver_smoking_western.pdf",
+                     "EAS ever vs Western never" = "../results/01_four_groups/figures/volcano_driver_crosscheck.pdf")
+  for (cn in names(contrast_files)) {
+    d = driver_scan[driver_scan$contrast == cn, ]
+    if (is.null(d) || nrow(d) == 0) {
+      next
+    }
+    p = volcano_plot(d, "log2_odds_ratio", "p_adjusted", "feature",
+                     paste0("Driver genes: ", cn),
+                     expression(log[2] * " odds ratio"), LABEL_GENES)
+    ggsave(contrast_files[cn], p,
+           width = 4.4, height = 4.2, device = cairo_pdf)
+  }
+  volcano_plot(driver_scan[driver_scan$contrast == "ancestry within never-smokers", ],
+               "log2_odds_ratio", "p_adjusted", "feature",
+               "Driver genes: ancestry within never-smokers",
+               expression(log[2] * " odds ratio"), LABEL_GENES)
+```
+
+```{r driver-frequency-figure}
+  freq = NULL
+  for (i in seq_along(LABEL_GENES)) {
+    g = LABEL_GENES[i]
+    hit = driver_meta$SampleID %in% snv_pa$SampleID[snv_pa$Gene == g]
+    if (sum(hit) < MIN_GENE_MUTATED) {
+      next
+    }
+    for (j in seq_along(CELL_LEVELS)) {
+      rows = driver_meta$Cell == CELL_LEVELS[j]
+      x = sum(hit[rows])
+      n = sum(rows)
+      ci = binom.test(x, n)$conf.int
+      freq = rbind(freq, data.frame(gene = g, Cell = CELL_LEVELS[j],
+                                    freq = x / n, lo = ci[1], hi = ci[2],
+                                    n = n, stringsAsFactors = FALSE))
+    }
+  }
+  freq$Cell = factor(freq$Cell, levels = CELL_LEVELS)
+  write.csv(freq, "../results/01_four_groups/tables/08_driver_frequency_by_cell.csv",
+            row.names = FALSE)
+
+  p_freq = ggplot(freq, aes(x = freq * 100, y = Cell, colour = Cell))
+  p_freq = p_freq + geom_errorbarh(aes(xmin = lo * 100, xmax = hi * 100),
+                                   height = 0.22, linewidth = 0.45, show.legend = FALSE)
+  p_freq = p_freq + geom_point(size = 2, show.legend = FALSE)
+  p_freq = p_freq + facet_wrap(~ gene, scales = "free_x")
+  p_freq = p_freq + scale_colour_manual(values = CELL_COLS)
+  p_freq = p_freq + scale_y_discrete(limits = rev(CELL_LEVELS),
+    labels = rev(c("EAS never", "EAS ever", "West never", "West ever")))
+  p_freq = p_freq + labs(x = "mutated tumours (%), 95% CI", y = NULL,
+                         title = "Protein-altering driver mutation frequency")
+  p_freq = p_freq + theme_pub()
+  ggsave("../results/figure1_panels/fig1b_top_driver_frequency.pdf", p_freq,
+         width = 8, height = 5, device = cairo_pdf)
+  p_freq
+```
+
+# 4. Mutational signatures, every active signature (Figure 1C)
+
+The four-cell signature panel plots every labelled signature; Figure 1C uses its
+SBS1 and SBS4 facets.
+
+```{r signature-scan}
+  sig_contrasts = NULL
+  sig_did = NULL
+# The bootstrap p value has a resolution floor of 1/(B+1). With B = 2,000 the
+# floor is 5.0e-4, which still clears 0.05 after correction across 89
+# signatures, so the bootstrap is used directly. Model-based interaction terms
+# are carried alongside as supporting evidence.
+#
+# A signature whose median is zero in all four cells has a difference in
+# differences of exactly zero and cannot be interpreted; those are recorded but
+# excluded from the interaction scan.
+  for (i in seq_along(sig_list)) {
+    v = sig_meta[[sig_list[i]]]
+    r = contrasts_continuous(v, sig_meta$CohortGroup, sig_meta$Smoking, sig_list[i])
+    sig_contrasts = rbind(sig_contrasts, r)
+    d = did_medians(v, sig_meta$CohortGroup, sig_meta$Smoking, sig_list[i], n_boot)
+    if (is.null(d)) {
+      next
+    }
+    m = did_models(v, sig_meta$CohortGroup, sig_meta$Smoking,
+                   sig_meta$Cohort, sig_list[i])
+    d$ols_p = m$ols_p
+    d$rank_p = m$rank_p
+    d$mixed_p = m$mixed_p
+    cell_medians = c(d$median_eas_never, d$median_eas_ever,
+                     d$median_west_never, d$median_west_ever)
+    d$degenerate = max(cell_medians) == 0
+    sig_did = rbind(sig_did, d)
+  }
+  sig_contrasts = adjust_within_contrast(sig_contrasts)
+  sig_did$p_adjusted = NA
+  usable = !sig_did$degenerate
+  sig_did$p_adjusted[usable] = p.adjust(sig_did$p_bootstrap[usable], method = "BH")
+  cat("signatures with a non-zero median in at least one cell:", sum(usable),
+      "of", nrow(sig_did), "\n")
+  write.csv(sig_contrasts, "../results/01_four_groups/tables/09_signature_contrasts.csv",
+            row.names = FALSE)
+  write.csv(sig_did, "../results/01_four_groups/tables/10_signature_interaction.csv",
+            row.names = FALSE)
+
+  cat("signatures tested:", length(sig_list), "\n")
+  cat("significant interaction:", sum(sig_did$p_adjusted < 0.05, na.rm = TRUE), "\n")
+  sig_did[order(sig_did$p_adjusted), c("feature", "delta_eas", "delta_western",
+                                       "did", "ci_low", "ci_high", "p_adjusted")][1:12, ]
+```
+
+```{r signature-volcanoes}
+  p_int = volcano_plot(sig_did, "did", "p_adjusted", "feature",
+                       "Smoking x ancestry interaction, all active signatures",
+                       "difference in differences (Western minus EAS)",
+                       LABEL_SIGNATURES, 10)
+  ggsave("../results/01_four_groups/figures/volcano_signature_interaction.pdf", p_int,
+         width = 4.6, height = 4.2, device = cairo_pdf)
+
+  for (cn in unique(sig_contrasts$contrast)) {
+    d = sig_contrasts[sig_contrasts$contrast == cn, ]
+    fn = gsub("[^a-z]+", "_", tolower(cn))
+    p = volcano_plot(d, "log2_ratio", "p_adjusted", "feature",
+                     paste0("Signatures: ", cn),
+                     expression(log[2] * " median ratio"), LABEL_SIGNATURES, 10)
+    ggsave(paste0("../results/01_four_groups/figures/volcano_signature_", fn, ".pdf"), p,
+           width = 4.6, height = 4.2, device = cairo_pdf)
+  }
+  p_int
+```
+
+```{r signature-boxplots}
+  show_sigs = intersect(LABEL_SIGNATURES, sig_list)
+  long = NULL
+  for (i in seq_along(show_sigs)) {
+    long = rbind(long, data.frame(Cell = sig_meta$Cell,
+                                  Signature = show_sigs[i],
+                                  value = sig_meta[[show_sigs[i]]],
+                                  stringsAsFactors = FALSE))
+  }
+  long = long[!is.na(long$value), ]
+  long$Signature = factor(long$Signature, levels = show_sigs)
+  p_sig = ggplot(long, aes(x = Cell, y = value, fill = Cell))
+  p_sig = p_sig + geom_jitter(width = 0.26, size = 0.35, alpha = 0.22,
+                              colour = "grey25", stroke = 0, show.legend = FALSE)
+  p_sig = p_sig + geom_boxplot(outlier.shape = NA, alpha = 0.6, linewidth = 0.3,
+                               width = 0.55, show.legend = FALSE)
+  p_sig = p_sig + facet_wrap(~ Signature, scales = "free_y", nrow = 2)
+  p_sig = p_sig + scale_fill_manual(values = CELL_COLS)
+  p_sig = p_sig + scale_x_discrete(labels = c("EAS\nnever", "EAS\never",
+                                              "West\nnever", "West\never"))
+  p_sig = p_sig + labs(x = NULL, y = "relative contribution",
+                       title = "Signature contribution across the four cells")
+  p_sig = p_sig + theme_pub()
+  ggsave("../results/figure1_panels/fig1c_signatures.pdf", p_sig,
+         width = 8, height = 4.6, device = cairo_pdf)
+  p_sig
+```
+
+# 5. Substitution spectrum (Figure 1C)
+
+```{r point-classes}
+  classes = c("C>A", "C>G", "C>T", "T>A", "T>C", "T>G")
+  point_contrasts = NULL
+  point_did = NULL
+  for (i in seq_along(classes)) {
+    v = point_meta[[classes[i]]]
+    r = contrasts_continuous(v, point_meta$CohortGroup, point_meta$Smoking, classes[i])
+    point_contrasts = rbind(point_contrasts, r)
+    d = did_medians(v, point_meta$CohortGroup, point_meta$Smoking, classes[i], n_boot)
+    point_did = rbind(point_did, d)
+  }
+  point_contrasts = adjust_within_contrast(point_contrasts)
+  point_did$p_adjusted = p.adjust(point_did$p_bootstrap, method = "BH")
+  write.csv(point_contrasts, "../results/01_four_groups/tables/11_point_class_contrasts.csv",
+            row.names = FALSE)
+  write.csv(point_did, "../results/01_four_groups/tables/12_point_class_interaction.csv",
+            row.names = FALSE)
+  point_did[, c("feature", "delta_eas", "delta_western", "did", "p_adjusted")]
+```
+
+```{r point-figure}
+  long = NULL
+  for (i in seq_along(classes)) {
+    long = rbind(long, data.frame(Cell = point_meta$Cell, Class = classes[i],
+                                  value = point_meta[[classes[i]]],
+                                  stringsAsFactors = FALSE))
+  }
+  long = long[!is.na(long$value), ]
+  agg = aggregate(value ~ Cell + Class, data = long, FUN = median)
+  p_pt = ggplot(agg, aes(x = Class, y = value * 100, fill = Cell))
+  p_pt = p_pt + geom_col(position = "dodge", width = 0.75)
+  p_pt = p_pt + scale_fill_manual(values = CELL_COLS, name = NULL)
+  p_pt = p_pt + labs(x = NULL, y = "median share of substitutions (%)",
+                     title = "Six-class substitution spectrum")
+  p_pt = p_pt + theme_pub()
+  p_pt = p_pt + theme(legend.position = "top")
+  ggsave("../results/01_four_groups/figures/point_class_spectrum.pdf", p_pt,
+         width = 5.5, height = 3.2, device = cairo_pdf)
+
+  p_ca = box_jitter_plot(point_meta, "Cell", "C>A", "Cell", CELL_COLS,
+                         "C>A share of all substitutions",
+                         "C>A transversions: a tobacco marker needing no COSMIC reference")
+  p_ca = p_ca + scale_x_discrete(labels = c("EAS\nnever", "EAS\never",
+                                            "West\nnever", "West\never"))
+  p_ca = p_ca + theme(legend.position = "none")
+  ggsave("../results/figure1_panels/fig1c_ca_fraction.pdf", p_ca,
+         width = 4, height = 3.6, device = cairo_pdf)
+  p_pt | p_ca
+```
+
+# 6. The 96-context profile
+
+```{r sbs96}
+  sbs96 = NULL
+  for (i in seq_along(SIGNATURE_COHORTS)) {
+    sp = read.csv(paste0("../data/signature/", SIGNATURE_COHORTS[i],
+                         "_spectrum96.csv"), stringsAsFactors = FALSE,
+                  check.names = FALSE)
+    samples = intersect(names(sp), meta$SampleID)
+    if (length(samples) == 0) {
+      next
+    }
+    m = as.matrix(sp[, samples, drop = FALSE])
+    for (j in seq_along(CELL_LEVELS)) {
+      ids = meta$SampleID[meta$Cell == CELL_LEVELS[j]]
+      use = intersect(colnames(m), ids)
+      if (length(use) == 0) {
+        next
+      }
+      sbs96 = rbind(sbs96, data.frame(Cell = CELL_LEVELS[j], Type = sp$Type,
+                                      Count = rowSums(m[, use, drop = FALSE]),
+                                      stringsAsFactors = FALSE))
+    }
+  }
+  agg96 = aggregate(Count ~ Cell + Type, data = sbs96, FUN = sum)
+  agg96$MutationClass = substr(agg96$Type, 3, 5)
+  totals = aggregate(Count ~ Cell, data = agg96, FUN = sum)
+  agg96$Fraction = agg96$Count / totals$Count[match(agg96$Cell, totals$Cell)]
+  agg96$Cell = factor(agg96$Cell, levels = CELL_LEVELS)
+  write.csv(agg96, "../results/01_four_groups/tables/13_sbs96_profile.csv", row.names = FALSE)
+
+  p96 = ggplot(agg96, aes(x = Type, y = Fraction * 100, fill = MutationClass))
+  p96 = p96 + geom_col(width = 0.8)
+  p96 = p96 + facet_grid(Cell ~ MutationClass, scales = "free_x", space = "free_x")
+  p96 = p96 + labs(x = NULL, y = "share of substitutions (%)",
+                   title = "96-context substitution profile by analysis cell")
+  p96 = p96 + theme_pub(7)
+  p96 = p96 + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+                    legend.position = "none")
+  ggsave("../results/01_four_groups/figures/sbs96_profile.pdf", p96,
+         width = 9, height = 5.5, device = cairo_pdf)
+  p96
+```
+
+# 7. All endpoints on one axis
+
+```{r summary-forest}
+  cols = c("feature", "did", "ci_low", "ci_high", "p_bootstrap",
+           "delta_eas", "delta_western")
+  all_did = NULL
+  all_did = rbind(all_did, data.frame(layer = "TMB", tmb_did[, cols],
+                                      stringsAsFactors = FALSE))
+  keep_sig = sig_did[sig_did$feature %in% LABEL_SIGNATURES, ]
+  if (nrow(keep_sig) > 0) {
+    all_did = rbind(all_did, data.frame(layer = "signature", keep_sig[, cols],
+                                        stringsAsFactors = FALSE))
+  }
+  all_did = rbind(all_did, data.frame(layer = "substitution class",
+                                      point_did[, cols], stringsAsFactors = FALSE))
+  write.csv(all_did, "../results/01_four_groups/tables/14_all_endpoint_interactions.csv",
+            row.names = FALSE)
+
+  all_did$feature = factor(all_did$feature, levels = all_did$feature[order(all_did$did)])
+  p_all = forest_plot(all_did, "did", "ci_low", "ci_high", "feature", "layer",
+                      c("TMB" = "#2C3E50", "signature" = "#C0392B",
+                        "substitution class" = "#3B6FB6"),
+                      "difference in differences (95% CI)",
+                      "Ancestry x smoking interaction, every endpoint")
+  p_all = p_all + facet_wrap(~ layer, scales = "free", ncol = 1)
+  ggsave("../results/01_four_groups/figures/all_endpoint_forest.pdf", p_all,
+         width = 5.5, height = 6, device = cairo_pdf)
+  p_all
+```
+
+# 8. Does "never-smoker" mean the same thing in both populations?
+
+```{r equivalence}
+  eq = NULL
+  d = tmb_contrasts[tmb_contrasts$contrast == "EAS ever vs Western never", ]
+  eq = rbind(eq, data.frame(layer = "TMB", feature = "TMB",
+                            eas_ever = d$median_a, western_never = d$median_b,
+                            p_value = d$p_value, stringsAsFactors = FALSE))
+  d = sig_contrasts[sig_contrasts$contrast == "EAS ever vs Western never", ]
+  eq = rbind(eq, data.frame(layer = "signature", feature = d$feature,
+                            eas_ever = d$median_a, western_never = d$median_b,
+                            p_value = d$p_value, stringsAsFactors = FALSE))
+  d = point_contrasts[point_contrasts$contrast == "EAS ever vs Western never", ]
+  eq = rbind(eq, data.frame(layer = "substitution class", feature = d$feature,
+                            eas_ever = d$median_a, western_never = d$median_b,
+                            p_value = d$p_value, stringsAsFactors = FALSE))
+  d = driver_scan[driver_scan$contrast == "EAS ever vs Western never", ]
+  eq = rbind(eq, data.frame(layer = "driver gene", feature = d$feature,
+                            eas_ever = d$freq_a, western_never = d$freq_b,
+                            p_value = d$p_value, stringsAsFactors = FALSE))
+  eq$p_adjusted = p.adjust(eq$p_value, method = "BH")
+  eq$indistinguishable = eq$p_adjusted >= 0.05
+  write.csv(eq, "../results/01_four_groups/tables/15_western_never_vs_eas_ever.csv",
+            row.names = FALSE)
+
+  summary_eq = NULL
+  for (ly in unique(eq$layer)) {
+    d = eq[eq$layer == ly, ]
+    summary_eq = rbind(summary_eq, data.frame(layer = ly, n_tested = nrow(d),
+      n_indistinguishable = sum(d$indistinguishable), stringsAsFactors = FALSE))
+  }
+  summary_eq
+```
+
+# 9. Layers not analysed
+
+Copy number and fusions are not analysed in this release. Two of the six
+cohorts supply only aggregate copy-number frequency tables and the three
+sample-level quantifications cannot be compared on common thresholds, while
+fusion calls differ too much between pipelines to be compared across cohorts.
+
+```{r session}
+  sessionInfo()
+```

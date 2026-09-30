@@ -1,0 +1,295 @@
+---
+title: "02 - Smoking response computed within each cohort"
+author: "Shuai Guo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+The change from never to ever smoking, computed **strictly inside each cohort**.
+No cross-cohort contrast enters any estimate, so a technical difference between
+cohorts cannot generate the pattern (R1-1, R2-6).
+
+Four cohorts carry enough tumours in both smoking strata: Chen2020, Xu2020,
+TCGA2014 and TRACERx2023. Chen2019 has no full exome mutation table and no
+signature refit; Guo2026 has eight ever-smokers. Both stay in the pooled
+analyses (01_four_groups and 03_pooled_vs_stratified) and are excluded here,
+which is stated rather than silent.
+
+Every layer that 01_four_groups analyses is analysed here as well: burden, all
+active signatures, the six substitution classes, and every gene tested
+genome-wide. The within-cohort forest plot is the left half of Figure 1D.
+
+```{r setup}
+  knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+  library(data.table)
+  library(ggplot2)
+  library(ggrepel)
+  library(patchwork)
+  source("_functions.R")
+
+  dir.create("../results/02_within_cohort/tables", showWarnings = FALSE, recursive = TRUE)
+  dir.create("../results/02_within_cohort/figures", showWarnings = FALSE, recursive = TRUE)
+  dir.create("../results/figure1_panels", showWarnings = FALSE, recursive = TRUE)
+
+  n_boot = 2000
+  set.seed(20260809)
+
+  meta = load_metadata(drop_ancestry = TRUE, drop_hyper = FALSE)
+  meta = meta[meta$Cohort %in% PER_COHORT_SET, ]
+  cohorts = PER_COHORT_SET
+  cohort_group = c(Chen2020 = "EAS", Xu2020 = "EAS",
+                   TCGA2014 = "Western", TRACERx2023 = "Western")
+
+  sig_wide = load_signature_relative()
+  sig_meta = merge(meta, sig_wide, by = "SampleID")
+  sig_list = active_signatures(sig_wide)
+  point_class = load_point_mutation_classes()
+  point_meta = merge(meta, point_class, by = "SampleID")
+  classes = c("C>A", "C>G", "C>T", "T>A", "T>C", "T>G")
+  table(meta$Cohort, meta$Smoking)
+```
+
+# 1. Burden, signatures and substitution classes
+
+```{r within-cohort-scan}
+  within = NULL
+  for (i in seq_along(cohorts)) {
+    co = cohorts[i]
+    d = meta[meta$Cohort == co & meta$HasTMB, ]
+    r = within_cohort_delta(d$NonsynonymousPerMb, d$Smoking, "TMB", n_boot)
+    if (!is.null(r)) {
+      r$cohort = co
+      r$cohort_group = cohort_group[co]
+      r$layer = "TMB"
+      within = rbind(within, r)
+    }
+    ds = sig_meta[sig_meta$Cohort == co, ]
+    for (j in seq_along(sig_list)) {
+      r = within_cohort_delta(ds[[sig_list[j]]], ds$Smoking, sig_list[j], n_boot)
+      if (!is.null(r)) {
+        r$cohort = co
+        r$cohort_group = cohort_group[co]
+        r$layer = "signature"
+        within = rbind(within, r)
+      }
+    }
+    dp = point_meta[point_meta$Cohort == co, ]
+    for (j in seq_along(classes)) {
+      r = within_cohort_delta(dp[[classes[j]]], dp$Smoking, classes[j], n_boot)
+      if (!is.null(r)) {
+        r$cohort = co
+        r$cohort_group = cohort_group[co]
+        r$layer = "substitution class"
+        within = rbind(within, r)
+      }
+    }
+  }
+  within$p_adjusted = p.adjust(within$p_bootstrap, method = "BH")
+  write.csv(within, "../results/02_within_cohort/tables/01_within_cohort_all_layers.csv",
+            row.names = FALSE)
+  cat("estimates:", nrow(within), " significant:",
+      sum(within$p_adjusted < 0.05, na.rm = TRUE), "\n")
+  within[within$feature %in% c("TMB", "SBS4", "SBS1", "C>A"),
+         c("cohort", "cohort_group", "feature", "n_never", "n_ever",
+           "median_never", "median_ever", "delta", "p_adjusted")]
+```
+
+```{r within-cohort-forest}
+  show = within[within$feature %in% c("TMB", "SBS4", "SBS1", "C>A", "SBS13"), ]
+  show$feature = factor(show$feature, levels = c("TMB", "SBS4", "C>A", "SBS1", "SBS13"))
+  show$cohort = factor(show$cohort, levels = cohorts)
+  p = forest_plot(show, "delta", "ci_low", "ci_high", "cohort", "cohort_group",
+                  GROUP_COLS, "change from never to ever smoking (median, 95% CI)",
+                  "Smoking response computed strictly within each cohort")
+  p = p + facet_wrap(~ feature, scales = "free_x", nrow = 1)
+  p = p + scale_y_discrete(limits = rev(cohorts))
+  ggsave("../results/figure1_panels/fig1d_left_within_cohort.pdf", p,
+         width = 9.5, height = 3, device = cairo_pdf)
+  p
+```
+
+```{r within-cohort-heatmap}
+  hm = within[within$layer == "signature", ]
+  keep = c()
+  for (i in seq_along(sig_list)) {
+    d = hm[hm$feature == sig_list[i], ]
+    if (nrow(d) > 0 && any(d$p_adjusted < 0.05, na.rm = TRUE)) {
+      keep = c(keep, sig_list[i])
+    }
+  }
+  hm = hm[hm$feature %in% keep, ]
+  hm$cohort = factor(hm$cohort, levels = cohorts)
+  p_hm = ggplot(hm, aes(x = cohort, y = feature, fill = delta))
+  p_hm = p_hm + geom_tile(colour = "white", linewidth = 0.4)
+  p_hm = p_hm + scale_fill_gradient2(low = "#3B6FB6", mid = "white",
+                                     high = "#C0392B", midpoint = 0,
+                                     name = "delta")
+  p_hm = p_hm + labs(x = NULL, y = NULL,
+                     title = "Signatures with a significant smoking response in any cohort")
+  p_hm = p_hm + theme_pub()
+  p_hm = p_hm + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  ggsave("../results/02_within_cohort/figures/signature_heatmap.pdf", p_hm,
+         width = 4.5, height = 5.5, device = cairo_pdf)
+  p_hm
+```
+
+```{r sbs4-distribution}
+  d = sig_meta
+  d$cohort = factor(d$Cohort, levels = cohorts)
+  d$Smoking = factor(d$Smoking, levels = c("Never", "Ever"))
+  p_box = ggplot(d, aes(x = Smoking, y = SBS4, fill = CohortGroup))
+  p_box = p_box + geom_jitter(width = 0.24, size = 0.45, alpha = 0.3,
+                              colour = "grey25", stroke = 0)
+  p_box = p_box + geom_boxplot(outlier.shape = NA, alpha = 0.6,
+                               linewidth = 0.35, width = 0.55)
+  p_box = p_box + facet_wrap(~ cohort, nrow = 1)
+  p_box = p_box + scale_fill_manual(values = GROUP_COLS, name = NULL)
+  p_box = p_box + labs(x = NULL, y = "SBS4 relative contribution",
+                       title = "SBS4 by smoking status within each cohort")
+  p_box = p_box + theme_pub()
+  p_box = p_box + theme(legend.position = "top")
+  ggsave("../results/02_within_cohort/figures/sbs4_by_cohort.pdf", p_box,
+         width = 7.5, height = 3.2, device = cairo_pdf)
+  p_box
+```
+
+```{r sbs4-high-fraction}
+  high = NULL
+  for (i in seq_along(cohorts)) {
+    for (sm in c("Never", "Ever")) {
+      d = sig_meta[sig_meta$Cohort == cohorts[i] & sig_meta$Smoking == sm, ]
+      if (nrow(d) < 3) {
+        next
+      }
+      high = rbind(high, data.frame(cohort = cohorts[i],
+                                    cohort_group = cohort_group[cohorts[i]],
+                                    smoking = sm, n = nrow(d),
+                                    pct_sbs4_above_10 =
+                                      round(100 * mean(d$SBS4 >= 0.10, na.rm = TRUE), 1),
+                                    median_sbs4 = round(median(d$SBS4, na.rm = TRUE), 4),
+                                    stringsAsFactors = FALSE))
+    }
+  }
+  write.csv(high, "../results/02_within_cohort/tables/02_sbs4_high_fraction.csv",
+            row.names = FALSE)
+  high
+```
+
+# 2. Driver genes within each cohort
+
+```{r within-cohort-drivers}
+  driver_meta = meta[meta$HasFullMAF, ]
+  snv_pa = load_protein_altering(cohorts)
+  gene_tab = table(snv_pa$Gene[snv_pa$SampleID %in% driver_meta$SampleID])
+  test_genes = names(gene_tab)[gene_tab >= MIN_GENE_MUTATED]
+  cat("genes tested:", length(test_genes), "\n")
+
+  drv = NULL
+  for (i in seq_along(cohorts)) {
+    d = driver_meta[driver_meta$Cohort == cohorts[i], ]
+    nv = d$Smoking == "Never"
+    ev = d$Smoking == "Ever"
+    if (sum(nv) < 5 || sum(ev) < 5) {
+      next
+    }
+    for (j in seq_along(test_genes)) {
+      hit = d$SampleID %in% snv_pa$SampleID[snv_pa$Gene == test_genes[j]]
+      a = hit[nv]
+      b = hit[ev]
+      tab = matrix(c(sum(a), length(a) - sum(a), sum(b), length(b) - sum(b)), nrow = 2)
+      odds = ((sum(b) + 0.5) * (length(a) - sum(a) + 0.5))
+      odds = odds / ((length(b) - sum(b) + 0.5) * (sum(a) + 0.5))
+      drv = rbind(drv, data.frame(cohort = cohorts[i],
+                                  cohort_group = cohort_group[cohorts[i]],
+                                  feature = test_genes[j],
+                                  n_never = length(a), freq_never = mean(a),
+                                  n_ever = length(b), freq_ever = mean(b),
+                                  log2_odds_ratio = log2(odds),
+                                  p_value = fisher.test(tab)$p.value,
+                                  stringsAsFactors = FALSE))
+    }
+  }
+  drv$p_adjusted = NA
+  for (i in seq_along(cohorts)) {
+    rows = drv$cohort == cohorts[i]
+    if (sum(rows) > 0) {
+      drv$p_adjusted[rows] = p.adjust(drv$p_value[rows], method = "BH")
+    }
+  }
+  write.csv(drv, "../results/02_within_cohort/tables/03_driver_within_cohort.csv",
+            row.names = FALSE)
+
+  tally = NULL
+  for (i in seq_along(cohorts)) {
+    d = drv[drv$cohort == cohorts[i], ]
+    if (nrow(d) == 0) {
+      next
+    }
+    tally = rbind(tally, data.frame(cohort = cohorts[i], n_tested = nrow(d),
+      n_significant = sum(d$p_adjusted < 0.05, na.rm = TRUE),
+      up_in_ever = sum(d$p_adjusted < 0.05 & d$log2_odds_ratio > 0, na.rm = TRUE),
+      up_in_never = sum(d$p_adjusted < 0.05 & d$log2_odds_ratio < 0, na.rm = TRUE),
+      stringsAsFactors = FALSE))
+  }
+  tally
+```
+
+```{r driver-volcano-per-cohort}
+  for (i in seq_along(cohorts)) {
+    d = drv[drv$cohort == cohorts[i], ]
+    if (nrow(d) == 0) {
+      next
+    }
+    p = volcano_plot(d, "log2_odds_ratio", "p_adjusted", "feature",
+                     paste0("Ever versus never smokers: ", cohorts[i]),
+                     expression(log[2] * " odds ratio (ever / never)"), LABEL_GENES)
+    p = p + scale_colour_manual(values = c("EAS-enriched" = "#C0392B",
+                                           "Western-enriched" = "#3B6FB6",
+                                           "ns" = "grey78"),
+                                labels = c("higher in ever", "higher in never", "ns"),
+                                name = NULL)
+    ggsave(paste0("../results/02_within_cohort/figures/volcano_driver_",
+                  tolower(cohorts[i]), ".pdf"), p,
+           width = 4.2, height = 4.2, device = cairo_pdf)
+  }
+  d = drv[drv$cohort == "TCGA2014", ]
+  volcano_plot(d, "log2_odds_ratio", "p_adjusted", "feature",
+               "Ever versus never smokers: TCGA2014",
+               expression(log[2] * " odds ratio (ever / never)"), LABEL_GENES)
+```
+
+```{r driver-slope}
+  show_genes = intersect(LABEL_GENES, unique(drv$feature))
+  d = drv[drv$feature %in% show_genes, ]
+  long = rbind(
+    data.frame(cohort = d$cohort, cohort_group = d$cohort_group, gene = d$feature,
+               smoking = "Never", freq = d$freq_never, stringsAsFactors = FALSE),
+    data.frame(cohort = d$cohort, cohort_group = d$cohort_group, gene = d$feature,
+               smoking = "Ever", freq = d$freq_ever, stringsAsFactors = FALSE))
+  long$smoking = factor(long$smoking, levels = c("Never", "Ever"))
+  p_slope = ggplot(long, aes(x = smoking, y = freq * 100, group = cohort,
+                             colour = cohort_group))
+  p_slope = p_slope + geom_line(linewidth = 0.5)
+  p_slope = p_slope + geom_point(size = 1.6)
+  p_slope = p_slope + facet_wrap(~ gene, scales = "free_y")
+  p_slope = p_slope + scale_colour_manual(values = GROUP_COLS, name = NULL)
+  p_slope = p_slope + labs(x = NULL, y = "mutated tumours (%)",
+                           title = "Driver frequency from never to ever smoking, one line per cohort")
+  p_slope = p_slope + theme_pub()
+  p_slope = p_slope + theme(legend.position = "top")
+  ggsave("../results/02_within_cohort/figures/driver_slope.pdf", p_slope,
+         width = 8, height = 5, device = cairo_pdf)
+  p_slope
+```
+
+# 3. Layers not estimable here
+
+Copy number cannot be stratified by smoking: two of the six cohorts supply
+aggregate frequency tables with no sample-level calls. Copy number and fusions
+are not analysed in this release, because neither the copy number
+quantifications nor the fusion calls are comparable across cohorts.
+
+```{r session}
+  sessionInfo()
+```

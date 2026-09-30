@@ -1,0 +1,415 @@
+---
+title: "06 Supplementary Tables S1-S3"
+author: "Shuai Guo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+Assembles Supplementary Tables S1 to S3 of the Letter from the harmonised
+metadata in `data/` and the tables already written by `01_four_groups.Rmd` and
+`05_sensitivity.Rmd`. Nothing is re-estimated here: no test and no bootstrap is
+run, so the tables reproduce the saved results exactly and this script can run
+on its own once 01 and 05 have been run.
+
+* **Table S1** cohort composition and endpoint-specific denominators
+* **Table S2** sensitivity to hypermutated tumours (source: 05, section 1)
+* **Table S3** reported race or ethnicity in the Western cohorts and sensitivity
+  to the Western-group definition (source: 05, section 3; primary TMB and SBS4
+  rows from section 1)
+
+Each table is written to `results/supplementary_tables/` as a long CSV with one
+table cell per line: `part` (A, B, C), `part_title`, the `row` and `column`
+labels, and the `value`. The numbers are those printed in the Supporting
+Information, but several labels are worded differently, mostly more fully (the
+printed "Smoking group" row, for example, is "Population group and smoking
+status" here). Table S1B adds the ever-smoker fractions quoted in the main text,
+and Table S3A adds two columns that list the Asian or part-Asian and Other
+tumours as reported; the printed tables omit both.
+
+The metadata are read directly rather than through `load_metadata()`, because
+Table S1B starts from all 1,467 harmonised tumours, before the reported-ancestry
+and missing-smoking exclusions. The restricted in-house variant file
+(`data/Guo2026_snv.csv`) is not needed here: the mutation-frequency denominators
+in Table S1C follow the tumours used by 01, which include Guo2026 only when that
+file was present when 01 was run.
+
+```{r setup}
+  knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+  dir.create("../results/supplementary_tables", showWarnings = FALSE, recursive = TRUE)
+
+  cell_levels = c("EAS Never", "EAS Ever", "Western Never", "Western Ever")
+  cohort_order = c("Guo2026", "Chen2019", "Chen2020", "Xu2020", "TCGA2014", "TRACERx2023")
+  number_word = c("one", "two", "three", "four", "five", "six")
+
+  # Every tumour harmonised by 00, including the reported-Asian exclusions and
+  # the tumours without recorded smoking status.
+  meta_raw = read.csv("../data/analysis_metadata.csv", stringsAsFactors = FALSE)
+  stopifnot(anyDuplicated(meta_raw$SampleID) == 0)
+
+  # The primary analysis set, defined exactly as load_metadata() defines it.
+  meta = meta_raw[!meta_raw$AncestryExcluded, ]
+  meta = meta[!is.na(meta$Smoking), ]
+  meta$Cell = factor(paste(meta$CohortGroup, meta$Smoking), levels = cell_levels)
+
+  # One table cell per line.
+  long_rows = function(part, part_title, row, column, value) {
+    out = data.frame(part = part, part_title = part_title, row = row,
+                     column = column, value = as.character(value),
+                     stringsAsFactors = FALSE)
+    out
+  }
+
+  # Wide view of one part, for reading in the report only.
+  show_part = function(tab, p) {
+    d = tab[tab$part == p, c("row", "column", "value")]
+    w = reshape(d, idvar = "row", timevar = "column", direction = "wide")
+    names(w) = sub("^value\\.", "", names(w))
+    rownames(w) = NULL
+    w
+  }
+
+  # "A, B, C, and D"
+  join_and = function(x) {
+    if (length(x) == 1) {
+      return(x)
+    }
+    paste0(paste(x[-length(x)], collapse = ", "), ", and ", x[length(x)])
+  }
+
+  fmt_ci = function(lo, hi) {
+    sprintf("%.3f to %.3f", lo, hi)
+  }
+
+  # The bootstrap P has a floor of 1/(n_boot + 1), 5.0e-4 with 2,000 resamples.
+  fmt_p = function(p) {
+    out = sprintf("%.3f", p)
+    out[p < 5e-4] = "<5.0 x 10^-4"
+    out
+  }
+```
+
+# Table S1. Cohort composition and endpoint-specific denominators
+
+## A. Tumours contributed by each cohort to the four analysis cells
+
+Counted from the primary analysis set and checked against
+`results/01_four_groups/tables/01_cell_counts.csv`, the source of Figure 1A.
+
+```{r s1-a}
+  title_a = "Tumors contributed by each cohort to the four analysis cells"
+  cell_cols = c("EAS never-smoker", "EAS ever-smoker",
+                "Western never-smoker", "Western ever-smoker")
+
+  counts = table(factor(meta$Cohort, levels = cohort_order), meta$Cell)
+  cell_counts = read.csv("../results/01_four_groups/tables/01_cell_counts.csv",
+                         row.names = 1, check.names = FALSE)
+  stopifnot(all(as.matrix(cell_counts[cohort_order, cell_levels]) ==
+                unclass(counts)[cohort_order, cell_levels]))
+
+  s1 = NULL
+  for (co in cohort_order) {
+    label = co
+    if (co == "Guo2026") {
+      label = "Guo2026 (in-house)"
+    }
+    group = unique(meta$CohortGroup[meta$Cohort == co])
+    s1 = rbind(s1, long_rows("A", title_a, label,
+                             c("Group", cell_cols, "Total"),
+                             c(group, counts[co, ], sum(counts[co, ]))))
+  }
+  s1 = rbind(s1, long_rows("A", title_a, "Total", c(cell_cols, "Total"),
+                           c(colSums(counts), sum(counts))))
+  show_part(s1, "A")
+```
+
+## B. Derivation of the primary analysis set
+
+The reported-Asian exclusion is applied first and the missing-smoking exclusion
+second; the two sets do not overlap.
+
+```{r s1-b}
+  title_b = "Derivation of the primary analysis set"
+
+  n_raw = nrow(meta_raw)
+  anc_out = meta_raw$AncestryExcluded
+  smk_out = !anc_out & is.na(meta_raw$Smoking)
+  anc_groups = unique(meta_raw$CohortGroup[anc_out])
+  smk_cohorts = unique(meta_raw$Cohort[smk_out])
+  stopifnot(n_raw - sum(anc_out) - sum(smk_out) == nrow(meta))
+
+  n_cell = table(meta$Cell)
+  cell_text = paste(n_cell, c("EAS never", "EAS ever", "Western never", "Western ever"))
+  eas = meta$CohortGroup == "EAS"
+  west = meta$CohortGroup == "Western"
+  ever_eas = 100 * sum(meta$Smoking[eas] == "Ever") / sum(eas)
+  ever_west = 100 * sum(meta$Smoking[west] == "Ever") / sum(west)
+
+  s1 = rbind(s1, long_rows("B", title_b,
+    paste("Harmonised across", number_word[length(unique(meta_raw$Cohort))], "cohorts"),
+    c("Tumors", "Basis"), c(n_raw, "One tumor per patient")))
+  s1 = rbind(s1, long_rows("B", title_b,
+    paste("Excluded from", paste(anc_groups, collapse = ", "), "cohorts"),
+    c("Tumors", "Basis"), c(-sum(anc_out), "Reported as Asian or part-Asian")))
+  s1 = rbind(s1, long_rows("B", title_b,
+    paste("Excluded from", paste(smk_cohorts, collapse = ", ")),
+    c("Tumors", "Basis"), c(-sum(smk_out), "Smoking status not recorded")))
+  s1 = rbind(s1, long_rows("B", title_b, "Primary analysis set",
+    c("Tumors", "Basis"), c(nrow(meta), paste(cell_text, collapse = " / "))))
+  s1 = rbind(s1, long_rows("B", title_b, "Ever-smoker fraction", "Basis",
+    sprintf("%.1f%% in EAS; %.1f%% in Western", ever_eas, ever_west)))
+  show_part(s1, "B")
+```
+
+## C. Endpoint-specific denominators
+
+Each endpoint uses the tumours carrying the relevant data layer, as flagged in
+the metadata by 00. The driver-panel size and the number of genes in the
+genome-wide scan are read from the 01 tables.
+
+```{r s1-c}
+  title_c = "Endpoint-specific denominators"
+  denom_cols = c("n", "EAS never", "EAS ever", "Western never", "Western ever",
+                 "Cohorts contributing")
+
+  # "All six", or e.g. "Five; Chen2019 excluded".
+  cohorts_note = function(flag) {
+    have = cohort_order[cohort_order %in% meta$Cohort[flag]]
+    miss = setdiff(cohort_order, have)
+    word = number_word[length(have)]
+    if (length(miss) == 0) {
+      return(paste("All", word))
+    }
+    word = paste0(toupper(substr(word, 1, 1)), substring(word, 2))
+    paste0(word, "; ", paste(miss, collapse = ", "), " excluded")
+  }
+
+  freq = read.csv("../results/01_four_groups/tables/08_driver_frequency_by_cell.csv",
+                  stringsAsFactors = FALSE)
+  hits = read.csv("../results/01_four_groups/tables/07_driver_hit_counts.csv",
+                  stringsAsFactors = FALSE)
+  n_drivers = length(unique(freq$gene))
+  n_scan = unique(hits$n_tested)
+  stopifnot(length(n_scan) == 1)
+
+  # 01 leaves Guo2026 out of the mutation-frequency analyses when the restricted
+  # variant file is absent (load_metadata()); follow the tumours 01 used.
+  has_maf = meta$HasFullMAF
+  n_maf = freq[freq$gene == freq$gene[1], ]
+  n_maf = n_maf$n[match(cell_levels, n_maf$Cell)]
+  if (sum(n_maf) != sum(has_maf)) {
+    has_maf[meta$Cohort == "Guo2026"] = FALSE
+  }
+  stopifnot(all(as.vector(table(meta$Cell[has_maf])) == n_maf))
+
+  endpoints = c("Population group and smoking status",
+                "Tumor mutation burden",
+                paste0("Mutation-frequency analyses (", n_drivers, "-driver panel and ",
+                       format(n_scan, big.mark = ","), "-gene scan)"),
+                "Mutational-signature refit and substitution classes")
+  flags = list(rep(TRUE, nrow(meta)), meta$HasTMB, has_maf, meta$HasSignature)
+  for (i in seq_along(endpoints)) {
+    f = flags[[i]]
+    by_cell = table(meta$Cell[f])
+    s1 = rbind(s1, long_rows("C", title_c, endpoints[i], denom_cols,
+                             c(sum(f), by_cell[cell_levels], cohorts_note(f))))
+  }
+
+  per_cohort = cohort_order[cohort_order %in% meta$Cohort[meta$InPerCohortAnalysis]]
+  s1 = rbind(s1, long_rows("C", title_c, "Within-cohort and cohort-pair analyses",
+                           c("n", "Cohorts contributing"),
+                           c("Varied by endpoint", join_and(per_cohort))))
+  show_part(s1, "C")
+
+  write.csv(s1,
+            "../results/supplementary_tables/TableS1_cohort_composition_and_denominators.csv",
+            row.names = FALSE)
+```
+
+n denotes tumours, one per patient. Chen2019 is excluded from the
+mutation-frequency and signature analyses because its deposited mutation file is
+a curated gene list rather than a complete exome-level variant table.
+
+# Table S2. Sensitivity analyses for hypermutation
+
+## A. Percentage of samples flagged as hypermutated
+
+```{r s2-a}
+  title_a = "Percentage of each primary analysis cell flagged as hypermutated"
+  bal = read.csv("../results/05_sensitivity/tables/01_hypermutation_balance.csv",
+                 stringsAsFactors = FALSE)
+
+  def_labels = c("mechanism (POLE/MMR/APOBEC)" =
+                   "Signature mechanism (POLE/MMR/APOBEC), primary",
+                 "TMB >= 10" = "TMB >= 10 mutations/Mb",
+                 "TMB >= 20" = "TMB >= 20 mutations/Mb",
+                 "cohort Q3 + 3 IQR" = "Cohort-specific extreme (Q3 + 3 x IQR)")
+  cell_labels = c("EAS Never" = "EAS never", "EAS Ever" = "EAS ever",
+                  "Western Never" = "Western never", "Western Ever" = "Western ever")
+
+  s2 = NULL
+  for (d in names(def_labels)) {
+    b = bal[bal$definition == d, ]
+    b = b[match(cell_levels, b$cell), ]
+    header = paste0(cell_labels[b$cell], " (n = ", b$n_cell, ")")
+    pct = sprintf("%.1f%%", 100 * b$n_flagged / b$n_cell)
+    s2 = rbind(s2, long_rows("A", title_a, def_labels[[d]], header, pct))
+  }
+  show_part(s2, "A")
+```
+
+## B. Ancestry-by-smoking interaction after excluding hypermutated tumours
+
+```{r s2-b}
+  title_b = "Ancestry-by-smoking interaction after excluding hypermutated tumors"
+  hyp = read.csv("../results/05_sensitivity/tables/03_hypermutation_sensitivity.csv",
+                 stringsAsFactors = FALSE)
+
+  scen_labels = c("full" = "Full analysis set (primary)",
+                  "exclude mechanism" = "Exclude signature-mechanism flagged",
+                  "exclude TMB >= 10" = "Exclude TMB >= 10 mutations/Mb",
+                  "exclude TMB >= 20" = "Exclude TMB >= 20 mutations/Mb",
+                  "exclude cohort extreme" = "Exclude cohort-specific extreme")
+  s2b_cols = c("Analysis-set tumors remaining",
+               "TMB DiD (mutations/Mb)", "TMB 95% CI",
+               "SBS4 DiD (relative contribution)", "SBS4 95% CI",
+               "SBS4 bootstrap P")
+
+  for (sc in names(scen_labels)) {
+    tmb = hyp[hyp$scenario == sc & hyp$feature == "TMB", ]
+    sbs4 = hyp[hyp$scenario == sc & hyp$feature == "SBS4", ]
+    stopifnot(nrow(tmb) == 1, nrow(sbs4) == 1)
+    s2 = rbind(s2, long_rows("B", title_b, scen_labels[[sc]], s2b_cols,
+                             c(tmb$n_total,
+                               round(tmb$did, 3), fmt_ci(tmb$ci_low, tmb$ci_high),
+                               round(sbs4$did, 3), fmt_ci(sbs4$ci_low, sbs4$ci_high),
+                               fmt_p(sbs4$p_bootstrap))))
+  }
+  show_part(s2, "B")
+
+  write.csv(s2, "../results/supplementary_tables/TableS2_hypermutation_sensitivity.csv",
+            row.names = FALSE)
+```
+
+Hypermutated tumours are flagged and retained in the primary analysis. DiD is
+the smoking-associated change in Western tumours minus the corresponding change
+in EAS tumours; an SBS4 DiD of 0.230 is 23.0 percentage points. The tumours
+remaining are counted before endpoint-specific missingness.
+
+# Table S3. Western cohorts' ethnicity and sensitivity to the Western-group definition
+
+## A. Reported race or ethnicity in the two Western cohorts before exclusions
+
+All tumours in the two Western cohorts, before any exclusion. The Asian or
+part-Asian category is the reported-ancestry exclusion flag set by 00; mixed
+White and Black is counted as Other.
+
+```{r s3-a}
+  title_a = "Reported race or ethnicity in the two Western cohorts before exclusions"
+  race_cols = c("White", "Not reported", "Black or African American",
+                "Asian or part-Asian", "Other")
+  fields = c("TCGA2014" = "Self-reported race", "TRACERx2023" = "Reported ethnicity")
+
+  # "3 Indian; 2 Middle eastern; ..." as the labels appear in the source files.
+  as_reported = function(x) {
+    tab = sort(table(x), decreasing = TRUE)
+    paste(paste(as.integer(tab), names(tab)), collapse = "; ")
+  }
+
+  s3 = NULL
+  for (co in names(fields)) {
+    info = read.csv(paste0("../data/", co, "_info.csv"), stringsAsFactors = FALSE)
+    stopifnot(all(info$SampleID %in% meta_raw$SampleID))
+    excluded = meta_raw$AncestryExcluded[match(info$SampleID, meta_raw$SampleID)]
+    race = tolower(info$ReportedRace)
+
+    category = rep("Other", nrow(info))
+    category[is.na(race) | race == "not reported"] = "Not reported"
+    category[grepl("black", race) & !grepl("white", race)] = "Black or African American"
+    category[grepl("^white", race) & !grepl(" and ", race)] = "White"
+    category[excluded] = "Asian or part-Asian"
+
+    n_cat = table(factor(category, levels = race_cols))
+    asian_text = as_reported(info$ReportedRace[category == "Asian or part-Asian"])
+    other_text = as_reported(info$ReportedRace[category == "Other"])
+    s3 = rbind(s3, long_rows("A", title_a, co,
+                             c("Field", race_cols,
+                               "Asian or part-Asian, as reported", "Other, as reported"),
+                             c(fields[[co]], n_cat, asian_text, other_text)))
+  }
+  show_part(s3, "A")
+```
+
+## B. Ancestry-by-smoking interaction under alternative Western-group definitions
+
+The definition-set sizes are rebuilt from the metadata with the rules used in
+`05_sensitivity.Rmd` section 3 and checked against the saved table. The White
+restriction there keeps every Western tumour whose reported race or ethnicity
+contains "white".
+
+`05_sensitivity.Rmd` bootstraps the primary set once in section 1 and again in
+section 3; the two runs share point estimates and differ only in the
+random-number stream. For TMB and SBS4, the two endpoints Table S2 reports, the
+primary row repeats the Table S2B estimate so that one primary interval is
+quoted across the two tables. SBS1 and C>A come from the section 3 run.
+
+```{r s3-b}
+  title_b = "Ancestry-by-smoking interaction under alternative Western-group definitions"
+  anc = read.csv("../results/05_sensitivity/tables/05_ancestry_restriction.csv",
+                 stringsAsFactors = FALSE)
+  primary = "exclude self-reported Asian"
+
+  for (f in c("TMB", "SBS4")) {
+    swap = anc$scenario == primary & anc$feature == f
+    src = hyp[hyp$scenario == "full" & hyp$feature == f, ]
+    stopifnot(sum(swap) == 1, nrow(src) == 1, anc$n_total[swap] == src$n_total)
+    anc$did[swap] = src$did
+    anc$ci_low[swap] = src$ci_low
+    anc$ci_high[swap] = src$ci_high
+    anc$p_bootstrap[swap] = src$p_bootstrap
+  }
+
+  # Definition sets before endpoint-specific missingness.
+  smoked = meta_raw[!is.na(meta_raw$Smoking), ]
+  west_all = smoked$CohortGroup == "Western"
+  west_white = west_all & grepl("white", tolower(smoked$ReportedRace))
+  def_total = c("all patients" = nrow(smoked),
+                "exclude self-reported Asian" = nrow(meta),
+                "Western restricted to reported White" = sum(!west_all) + sum(west_white))
+  def_west = c("all patients" = sum(west_all),
+               "exclude self-reported Asian" = sum(meta$CohortGroup == "Western"),
+               "Western restricted to reported White" = sum(west_white))
+
+  scen_labels = c("all patients" =
+                    "All patients (no race/ethnicity exclusion)",
+                  "exclude self-reported Asian" =
+                    "Exclude reported Asian or part-Asian (primary)",
+                  "Western restricted to reported White" =
+                    "Western group restricted to reported White")
+  s3b_cols = c("Endpoint", "Scenario", "Definition-set n total", "Western n",
+               "DiD", "95% CI", "Bootstrap P")
+
+  for (f in c("TMB", "SBS4", "SBS1", "C>A")) {
+    for (sc in names(scen_labels)) {
+      r = anc[anc$feature == f & anc$scenario == sc, ]
+      stopifnot(nrow(r) == 1, r$n_total == def_total[[sc]])
+      s3 = rbind(s3, long_rows("B", title_b, paste0(f, ": ", scen_labels[[sc]]),
+                               s3b_cols,
+                               c(f, scen_labels[[sc]], r$n_total, def_west[[sc]],
+                                 round(r$did, 3), fmt_ci(r$ci_low, r$ci_high),
+                                 fmt_p(r$p_bootstrap))))
+    }
+  }
+  show_part(s3, "B")
+
+  write.csv(s3, "../results/supplementary_tables/TableS3_western_group_definition.csv",
+            row.names = FALSE)
+```
+
+The four EAS cohorts carry cohort-level designations; no individual
+genotype-based ancestry estimate is available. TMB is in mutations/Mb, whereas
+SBS4, SBS1 and C>A are proportions.
+
+```{r session}
+  sessionInfo()
+```

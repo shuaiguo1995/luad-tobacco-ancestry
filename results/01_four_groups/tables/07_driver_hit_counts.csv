@@ -1,0 +1,6 @@
+"contrast","n_tested","n_significant","eas_enriched","western_enriched"
+"ancestry within never-smokers",8428,89,1,88
+"ancestry within ever-smokers",8428,36,18,18
+"smoking within EAS",8428,118,1,117
+"smoking within Western",8428,151,1,150
+"EAS ever vs Western never",8428,27,24,3

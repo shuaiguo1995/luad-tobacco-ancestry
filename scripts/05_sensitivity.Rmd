@@ -1,0 +1,302 @@
+---
+title: "05 - Sensitivity analyses and technical checks"
+author: "Shuai Guo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+Robustness and comparability checks supporting Figure 1 (scripts 01 to 04).
+Section 1 is the source of Supplementary Table S2 and section 3 the source of
+Supplementary Table S3, whose primary TMB and SBS4 rows are taken from section 1;
+both tables are written by 06_supplementary_tables.Rmd.
+
+* **R2-1** the effect of hypermutated tumours, which are flagged but retained
+* **R2-2** the effect of the reported-ancestry restriction
+* **R2-4** variant class comparability, and the non-coding comparison that is
+  deliberately kept out of the main text
+* **R1-1, R2-6** leave-one-cohort-out robustness, and the copy number
+  comparability audit
+
+```{r setup}
+  knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+  library(data.table)
+  library(ggplot2)
+  library(patchwork)
+  source("_functions.R")
+
+  dir.create("../results/05_sensitivity/tables", showWarnings = FALSE, recursive = TRUE)
+  dir.create("../results/05_sensitivity/figures", showWarnings = FALSE, recursive = TRUE)
+
+  n_boot = 2000
+  set.seed(20260809)
+
+  meta_all = load_metadata(drop_ancestry = FALSE, drop_hyper = FALSE)
+  meta = load_metadata(drop_ancestry = TRUE, drop_hyper = FALSE)
+  sig_wide = load_signature_relative()
+  sig_list = active_signatures(sig_wide)
+  point_class = load_point_mutation_classes()
+  classes = c("C>A", "C>G", "C>T", "T>A", "T>C", "T>G")
+  key_features = c("TMB", "SBS4", "SBS1", "SBS13", "C>A")
+```
+
+# 1. Hypermutation
+
+## 1.1 Is the flag balanced across the four cells?
+
+A fixed burden cut-off is not a neutral instrument here. Burden is far higher in
+the Western cohorts, so a threshold removes mostly Western ever-smokers, that is
+exactly the tumours carrying the effect under test.
+
+```{r hyper-balance}
+  defs = c("HypermutatedMechanism", "HypermutatedTMB10",
+           "HypermutatedTMB20", "HypermutatedCohortExtreme")
+  labels = c("mechanism (POLE/MMR/APOBEC)", "TMB >= 10", "TMB >= 20",
+             "cohort Q3 + 3 IQR")
+  bal = NULL
+  for (i in seq_along(defs)) {
+    flag = meta[[defs[i]]] %in% TRUE
+    for (j in seq_along(CELL_LEVELS)) {
+      rows = meta$Cell == CELL_LEVELS[j]
+      bal = rbind(bal, data.frame(definition = labels[i], cell = CELL_LEVELS[j],
+        n_cell = sum(rows), n_flagged = sum(flag & rows),
+        pct_flagged = round(100 * sum(flag & rows) / sum(rows), 1),
+        stringsAsFactors = FALSE))
+    }
+  }
+  write.csv(bal, "../results/05_sensitivity/tables/01_hypermutation_balance.csv", row.names = FALSE)
+
+  bal$cell = factor(bal$cell, levels = CELL_LEVELS)
+  bal$definition = factor(bal$definition, levels = labels)
+  p_bal = ggplot(bal, aes(x = cell, y = pct_flagged, fill = cell))
+  p_bal = p_bal + geom_col(width = 0.7, show.legend = FALSE)
+  p_bal = p_bal + geom_text(aes(label = paste0(pct_flagged, "%")), vjust = -0.35,
+                            size = 2.4)
+  p_bal = p_bal + facet_wrap(~ definition, nrow = 1)
+  p_bal = p_bal + scale_fill_manual(values = CELL_COLS)
+  p_bal = p_bal + scale_x_discrete(labels = c("EAS\nnever", "EAS\never",
+                                              "West\nnever", "West\never"))
+  p_bal = p_bal + labs(x = NULL, y = "tumours flagged (%)",
+                       title = "A fixed burden cut-off removes Western ever-smokers preferentially")
+  p_bal = p_bal + theme_pub()
+  ggsave("../results/05_sensitivity/figures/hypermutation_balance.pdf", p_bal,
+         width = 8.5, height = 3, device = cairo_pdf)
+  p_bal
+```
+
+```{r hyper-mechanism}
+  mech = table(meta$HypermutationMechanism, meta$Cell)
+  write.csv(as.data.frame.matrix(mech),
+            "../results/05_sensitivity/tables/02_hypermutation_mechanism.csv")
+  mech
+```
+
+## 1.2 Do the conclusions hold with hypermutated tumours removed?
+
+```{r hyper-sensitivity}
+  run_key = function(m, tag) {
+    sm = merge(m, sig_wide, by = "SampleID")
+    pm = merge(m, point_class, by = "SampleID")
+    out = NULL
+    d = m[m$HasTMB, ]
+    r = did_medians(d$NonsynonymousPerMb, d$CohortGroup, d$Smoking, "TMB", n_boot)
+    if (!is.null(r)) {
+      out = rbind(out, r)
+    }
+    for (i in seq_along(key_features)) {
+      f = key_features[i]
+      if (f %in% names(sm)) {
+        r = did_medians(sm[[f]], sm$CohortGroup, sm$Smoking, f, n_boot)
+        if (!is.null(r)) {
+          out = rbind(out, r)
+        }
+      }
+      if (f %in% names(pm)) {
+        r = did_medians(pm[[f]], pm$CohortGroup, pm$Smoking, f, n_boot)
+        if (!is.null(r)) {
+          out = rbind(out, r)
+        }
+      }
+    }
+    out$scenario = tag
+    out$n_total = nrow(m)
+    out
+  }
+
+  sens = NULL
+  sens = rbind(sens, run_key(meta, "full"))
+  sens = rbind(sens, run_key(meta[!(meta$HypermutatedMechanism %in% TRUE), ],
+                             "exclude mechanism"))
+  sens = rbind(sens, run_key(meta[!meta$HypermutatedTMB10, ], "exclude TMB >= 10"))
+  sens = rbind(sens, run_key(meta[!meta$HypermutatedTMB20, ], "exclude TMB >= 20"))
+  sens = rbind(sens, run_key(meta[!meta$HypermutatedCohortExtreme, ],
+                             "exclude cohort extreme"))
+  write.csv(sens, "../results/05_sensitivity/tables/03_hypermutation_sensitivity.csv",
+            row.names = FALSE)
+
+  sens$scenario = factor(sens$scenario, levels = c("full", "exclude mechanism",
+    "exclude TMB >= 10", "exclude TMB >= 20", "exclude cohort extreme"))
+  p_sens = forest_plot(sens, "did", "ci_low", "ci_high", "scenario", "feature",
+                       c("TMB" = "#2C3E50", "SBS4" = "#C0392B", "SBS1" = "#3B6FB6",
+                         "SBS13" = "#7F8C8D", "C>A" = "#E67E22"),
+                       "difference in differences (95% CI)",
+                       "The interaction holds under every hypermutation definition")
+  p_sens = p_sens + facet_wrap(~ feature, scales = "free_x", nrow = 1)
+  p_sens = p_sens + scale_y_discrete(limits = rev(levels(sens$scenario)))
+  ggsave("../results/05_sensitivity/figures/hypermutation_sensitivity.pdf", p_sens,
+         width = 10, height = 3, device = cairo_pdf)
+  sens[sens$feature %in% c("TMB", "SBS4"),
+       c("feature", "scenario", "n_total", "did", "ci_low", "ci_high", "p_bootstrap")]
+```
+
+# 2. Leave one cohort out
+
+```{r loco}
+  loco = NULL
+  drops = c("none", unique(meta$Cohort))
+  for (k in seq_along(drops)) {
+    m = meta
+    if (drops[k] != "none") {
+      m = meta[meta$Cohort != drops[k], ]
+    }
+    if (length(unique(m$CohortGroup)) < 2) {
+      next
+    }
+    r = run_key(m, drops[k])
+    if (!is.null(r)) {
+      r$dropped = drops[k]
+      loco = rbind(loco, r)
+    }
+  }
+  write.csv(loco, "../results/05_sensitivity/tables/04_leave_one_cohort_out.csv", row.names = FALSE)
+
+  show = loco[loco$feature %in% c("TMB", "SBS4", "SBS1"), ]
+  show$dropped = factor(show$dropped, levels = drops)
+  p_loco = forest_plot(show, "did", "ci_low", "ci_high", "dropped", "feature",
+                       c("TMB" = "#2C3E50", "SBS4" = "#C0392B", "SBS1" = "#3B6FB6"),
+                       "difference in differences (95% CI)",
+                       "Leave one cohort out")
+  p_loco = p_loco + facet_wrap(~ feature, scales = "free_x", nrow = 1)
+  p_loco = p_loco + scale_y_discrete(limits = rev(drops))
+  ggsave("../results/05_sensitivity/figures/leave_one_cohort_out.pdf", p_loco,
+         width = 8, height = 3.2, device = cairo_pdf)
+  show[show$feature == "SBS4", c("dropped", "n_total", "did", "ci_low",
+                                 "ci_high", "p_bootstrap")]
+```
+
+# 3. Reported-ancestry restriction
+
+```{r ancestry-sensitivity}
+  race = tolower(as.character(meta_all$ReportedRace))
+  white_only = meta_all
+  is_west = white_only$CohortGroup == "Western"
+  keep_west = is_west & grepl("white", race)
+  white_only = white_only[!is_west | keep_west, ]
+
+  anc = NULL
+  anc = rbind(anc, run_key(meta_all, "all patients"))
+  anc = rbind(anc, run_key(meta, "exclude self-reported Asian"))
+  anc = rbind(anc, run_key(white_only, "Western restricted to reported White"))
+  write.csv(anc, "../results/05_sensitivity/tables/05_ancestry_restriction.csv", row.names = FALSE)
+
+  counts = data.frame(scenario = c("all patients", "exclude self-reported Asian",
+                                   "Western restricted to reported White"),
+                      n = c(nrow(meta_all), nrow(meta), nrow(white_only)),
+                      stringsAsFactors = FALSE)
+  counts
+  anc[anc$feature %in% c("TMB", "SBS4"),
+      c("feature", "scenario", "n_total", "did", "ci_low", "ci_high", "p_bootstrap")]
+```
+
+# 4. Variant class comparability
+
+```{r variant-class}
+  vc = read.csv("../data/variant_class_audit.csv", stringsAsFactors = FALSE)
+  write.csv(vc, "../results/05_sensitivity/tables/06_variant_class_audit.csv", row.names = FALSE)
+  vc
+
+  long = rbind(
+    data.frame(Cohort = vc$Cohort, class = "protein-altering", n = vc$ProteinAltering),
+    data.frame(Cohort = vc$Cohort, class = "silent", n = vc$Silent),
+    data.frame(Cohort = vc$Cohort, class = "non-coding", n = vc$Noncoding))
+  long$Cohort = factor(long$Cohort,
+                       levels = vc$Cohort[order(vc$NoncodingToProteinRatio)])
+  p_vc = ggplot(long, aes(x = Cohort, y = n, fill = class))
+  p_vc = p_vc + geom_col(position = "fill", width = 0.7)
+  p_vc = p_vc + scale_fill_manual(values = c("protein-altering" = "#C0392B",
+                                             "silent" = "#7F8C8D",
+                                             "non-coding" = "#3B6FB6"), name = NULL)
+  p_vc = p_vc + labs(x = NULL, y = "share of called variants",
+                     title = "Variant class composition tracks annotation depth, not biology")
+  p_vc = p_vc + theme_pub()
+  p_vc = p_vc + theme(axis.text.x = element_text(angle = 30, hjust = 1),
+                      legend.position = "top")
+  ggsave("../results/05_sensitivity/figures/variant_class.pdf", p_vc,
+         width = 5, height = 3.6, device = cairo_pdf)
+  p_vc
+```
+
+```{r noncoding}
+  nc = NULL
+  for (co in PER_COHORT_SET) {
+    d = fread(paste0("../data/", co, "_snv.csv"), data.table = FALSE,
+              showProgress = FALSE)
+    d = d[d$SampleID %in% meta$SampleID, ]
+    tot = table(d$SampleID)
+    ncc = table(d$SampleID[d$VariantClass == "noncoding"])
+    ids = names(tot)
+    v = as.integer(ncc[ids])
+    v[is.na(v)] = 0
+    nc = rbind(nc, data.frame(SampleID = ids, n_total = as.integer(tot[ids]),
+                              n_noncoding = v, stringsAsFactors = FALSE))
+  }
+  nc = merge(meta[, c("SampleID", "Cohort", "CohortGroup", "Smoking")], nc,
+             by = "SampleID")
+  nc_summary = aggregate(cbind(n_total, n_noncoding) ~ Cohort + CohortGroup + Smoking,
+                         data = nc, FUN = median)
+  write.csv(nc_summary, "../results/05_sensitivity/tables/07_noncoding_by_cohort.csv",
+            row.names = FALSE)
+  nc_summary
+```
+
+A cross-cohort comparison of non-coding variant frequency measures annotation
+and capture practice rather than biology, which is why it stays in this
+repository and is not cited in the main text.
+
+# 5. Copy number comparability
+
+```{r cnv-audit}
+  audit = data.frame(
+    cohort = c("Chen2020", "TCGA2014", "TRACERx2023", "Guo2026", "Xu2020", "Chen2019"),
+    level = c("sample", "sample", "sample", "sample", "aggregate", "aggregate"),
+    quantification = c("GISTIC discrete -2..2",
+                       "ASCAT2 absolute integer copy number",
+                       "GISTIC peak calls, AMP/DEL, clonal/subclonal",
+                       "segment-level gain/loss with LOH, encoding undocumented",
+                       "published gene by tumour counts",
+                       "published arm-level frequencies, two rows"),
+    genome_build = c("hg19", "hg38", "hg19", "hg38", "unknown", "unknown"),
+    used_here = c(TRUE, TRUE, TRUE, FALSE, FALSE, FALSE),
+    stringsAsFactors = FALSE)
+  write.csv(audit, "../results/05_sensitivity/tables/08_cnv_comparability_audit.csv",
+            row.names = FALSE)
+  audit
+```
+
+Copy number is not compared in this release. The three sample-level
+quantifications flagged `used_here` by the earlier pipeline (GISTIC discrete
+calls, ASCAT2 absolute copy number, GISTIC peak calls) share no common scale, so
+any threshold would compare pipelines rather than tumours.
+
+# 6. Power of the pairwise separation test
+
+```{r wilcox-floor}
+  floor_p = wilcox.test(c(4, 5, 6, 7), c(1, 2))$p.value
+  cat("smallest attainable P with 4 cross-ancestry and 2 within-ancestry pairs:",
+      round(floor_p, 4), "\n")
+  cat("the informative statistic is complete separation, not this P value\n")
+```
+
+```{r session}
+  sessionInfo()
+```
